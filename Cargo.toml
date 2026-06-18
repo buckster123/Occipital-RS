@@ -31,6 +31,7 @@ reqwest     = { version = "0.12", default-features = false, features = ["rustls-
 url         = "2"
 # HTML parsing (reader-mode extraction)
 scraper     = "0.19"
+ego-tree    = "0.6" # scraper's DOM node type — matched so NodeRef<Node> unifies
 # dyn-safe async traits (the Fetcher seam)
 async-trait = "0.1"
 # Per-domain rate limiting
