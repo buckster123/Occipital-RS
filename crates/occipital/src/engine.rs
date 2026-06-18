@@ -3,13 +3,17 @@
 //! surface needs: `search`, `fetch`, `save`, `forget`. Freshness *policy* (the
 //! TTL) lives here; the cache only records `fetched_at`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{
+    Config, DEFAULT_DECAY_HALFLIFE_SECS, DEFAULT_GC_MIN_AGE_SECS, DEFAULT_GC_MIN_SALIENCE,
+};
+use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Page};
 use crate::fetch::{Fetcher, PoliteFetcher};
@@ -26,12 +30,15 @@ pub struct RecallHit {
 }
 
 pub struct Engine {
-    fetcher:        Arc<dyn Fetcher>,
-    provider:       Box<dyn SearchProvider>,
-    cache:          Option<Arc<Cache>>,
-    embedder:       Option<Arc<dyn Embedder>>,
-    top_n:          usize,
-    fresh_ttl_secs: u64,
+    fetcher:            Arc<dyn Fetcher>,
+    provider:           Box<dyn SearchProvider>,
+    cache:              Option<Arc<Cache>>,
+    embedder:           Option<Arc<dyn Embedder>>,
+    top_n:              usize,
+    fresh_ttl_secs:     u64,
+    decay_half_life_secs: u64,
+    gc_min_salience:    f32,
+    gc_min_age_secs:    u64,
 }
 
 impl Engine {
@@ -52,11 +59,16 @@ impl Engine {
             embedder: make_embedder(&cfg.embed_model),
             top_n: cfg.search_top_n,
             fresh_ttl_secs: cfg.fresh_ttl_secs,
+            decay_half_life_secs: cfg.decay_half_life_secs,
+            gc_min_salience: cfg.gc_min_salience,
+            gc_min_age_secs: cfg.gc_min_age_secs,
         })
     }
 
     /// Inject parts directly (tests / custom embeddings). Embedder defaults to
-    /// none (FTS5 recall) — add one with [`with_embedder`](Self::with_embedder).
+    /// none (FTS5 recall) — add one with [`with_embedder`](Self::with_embedder);
+    /// decay/GC default to the config defaults — override with
+    /// [`with_gc_params`](Self::with_gc_params).
     pub fn with_parts(
         fetcher: Arc<dyn Fetcher>,
         provider: Box<dyn SearchProvider>,
@@ -64,11 +76,28 @@ impl Engine {
         top_n: usize,
         fresh_ttl_secs: u64,
     ) -> Self {
-        Self { fetcher, provider, cache, embedder: None, top_n, fresh_ttl_secs }
+        Self {
+            fetcher,
+            provider,
+            cache,
+            embedder: None,
+            top_n,
+            fresh_ttl_secs,
+            decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
+            gc_min_salience: DEFAULT_GC_MIN_SALIENCE,
+            gc_min_age_secs: DEFAULT_GC_MIN_AGE_SECS,
+        }
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<dyn Embedder>>) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    pub fn with_gc_params(mut self, half_life_secs: u64, min_salience: f32, min_age_secs: u64) -> Self {
+        self.decay_half_life_secs = half_life_secs;
+        self.gc_min_salience = min_salience;
+        self.gc_min_age_secs = min_age_secs;
         self
     }
 
@@ -180,7 +209,9 @@ impl Engine {
     }
 
     /// Recall over **already-read** pages only (no live web). Semantic (cosine)
-    /// when embeddings are on, FTS5 keyword otherwise. Returns ranked hits.
+    /// when embeddings are on, FTS5 keyword otherwise. Relevance is scaled by a
+    /// **disuse decay** factor, so a stale, long-unread page sinks beneath a
+    /// fresher one of equal relevance. Returns ranked hits.
     pub async fn recall(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<RecallHit>> {
         if query.trim().is_empty() {
             anyhow::bail!("empty query");
@@ -188,19 +219,43 @@ impl Engine {
         let n = limit.unwrap_or(self.top_n).clamp(1, 50);
         let Some(cache) = &self.cache else { return Ok(Vec::new()) };
 
-        let ranked: Vec<(String, Option<f32>)> = if let Some(embedder) = &self.embedder {
+        let now = Utc::now();
+        let half = self.decay_half_life_secs as f64;
+        let disuse: HashMap<String, f64> = cache
+            .all_page_meta()?
+            .into_iter()
+            .map(|m| (m.url, (now - m.last_access).num_seconds().max(0) as f64))
+            .collect();
+        let decay_of = |url: &str| decay_factor(*disuse.get(url).unwrap_or(&0.0), half);
+
+        // (url, display_score, decayed_rank)
+        let mut ranked: Vec<(String, Option<f32>, f64)> = if let Some(embedder) = &self.embedder {
             let qv = embedder.embed(query)?;
-            let mut scored: Vec<(String, f32)> =
-                cache.all_embeddings()?.into_iter().map(|(u, v)| (u, cosine(&qv, &v))).collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(n);
-            scored.into_iter().map(|(u, s)| (u, Some(s))).collect()
+            cache
+                .all_embeddings()?
+                .into_iter()
+                .map(|(u, v)| {
+                    let cos = cosine(&qv, &v);
+                    let rank = cos as f64 * decay_of(&u);
+                    (u, Some(cos), rank)
+                })
+                .collect()
         } else {
-            cache.keyword_search(query, n)?.into_iter().map(|u| (u, None)).collect()
+            // Keyword matches all have relevance 1.0; decay orders them by recency.
+            cache
+                .keyword_search(query, 50)?
+                .into_iter()
+                .map(|u| {
+                    let rank = decay_of(&u);
+                    (u, None, rank)
+                })
+                .collect()
         };
+        ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(n);
 
         let mut hits = Vec::new();
-        for (url, score) in ranked {
+        for (url, score, _) in ranked {
             if let Some(row) = cache.get_page(&url)? {
                 hits.push(RecallHit {
                     url,
@@ -211,6 +266,33 @@ impl Engine {
             }
         }
         Ok(hits)
+    }
+
+    /// Garbage-collect stale memory: prune unpinned pages whose **effective
+    /// salience** (stored × disuse decay) has fallen below the floor, once they
+    /// are older than the min-age. Pinned pages and recent fetches always
+    /// survive. Returns the number pruned.
+    pub fn gc(&self) -> anyhow::Result<usize> {
+        let Some(cache) = &self.cache else { return Ok(0) };
+        let now = Utc::now();
+        let half = self.decay_half_life_secs as f64;
+        let mut pruned = 0;
+        for m in cache.all_page_meta()? {
+            if m.pinned {
+                continue;
+            }
+            let age = (now - m.fetched_at).num_seconds().max(0) as f64;
+            if age < self.gc_min_age_secs as f64 {
+                continue;
+            }
+            let disuse = (now - m.last_access).num_seconds().max(0) as f64;
+            if effective_salience(m.salience, disuse, half) < self.gc_min_salience
+                && cache.delete_page(&m.url)?
+            {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 
     /// Evict a URL from the cache. `false` if it wasn't cached (or no cache).
@@ -412,5 +494,54 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://e.test/rust");
         assert!(hits[0].score.is_none(), "keyword recall has no cosine score");
+    }
+
+    // ---- decay & GC (Phase 6) -------------------------------------------
+
+    use chrono::Duration;
+
+    /// Like `recall_engine` but hands back the cache so a test can backdate pages.
+    fn engine_and_cache(pages: &[(&str, &str)]) -> (Engine, Arc<Cache>) {
+        let cache = Arc::new(Cache::open_in_memory().unwrap());
+        for (url, body) in pages {
+            cache.put_page(&mkpage(url, body), None, None, false).unwrap();
+        }
+        let engine = Engine::with_parts(Counting::new(""), Box::new(DuckDuckGo), Some(cache.clone()), 5, 3600);
+        (engine, cache)
+    }
+
+    #[test]
+    fn gc_prunes_stale_unpinned_keeps_pinned_and_fresh() {
+        let (e, cache) = engine_and_cache(&[
+            ("https://e.test/stale", "old unused page"),
+            ("https://e.test/pinned", "old but pinned"),
+            ("https://e.test/fresh", "recently used"),
+        ]);
+        let old = (Utc::now() - Duration::days(60)).to_rfc3339();
+        cache.set_timestamps("https://e.test/stale", &old, &old);
+        cache.set_timestamps("https://e.test/pinned", &old, &old);
+        cache.set_pinned("https://e.test/pinned", true).unwrap();
+        // half-life 1 day → 60 days of disuse decays the stale page to ~0.
+        let e = e.with_gc_params(86_400, 0.15, 3_600);
+        let pruned = e.gc().unwrap();
+        assert_eq!(pruned, 1, "only the stale, unpinned page is pruned");
+        assert!(cache.get_page("https://e.test/stale").unwrap().is_none());
+        assert!(cache.get_page("https://e.test/pinned").unwrap().is_some(), "pinned survives decay");
+        assert!(cache.get_page("https://e.test/fresh").unwrap().is_some(), "fresh survives");
+    }
+
+    #[tokio::test]
+    async fn recall_decay_sinks_stale_pages_below_fresh() {
+        // Identical content → equal relevance; only recency should separate them.
+        let (e, cache) = engine_and_cache(&[
+            ("https://e.test/old", "rust programming language"),
+            ("https://e.test/new", "rust programming language"),
+        ]);
+        let old = (Utc::now() - Duration::days(30)).to_rfc3339();
+        cache.set_timestamps("https://e.test/old", &old, &old);
+        let e = e.with_gc_params(86_400, 0.15, 3_600); // sharp 1-day half-life
+        let hits = e.recall("rust", Some(2)).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://e.test/new", "the fresher page ranks first");
     }
 }

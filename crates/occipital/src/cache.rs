@@ -28,6 +28,16 @@ pub struct PageRow {
     pub pinned:        bool,
 }
 
+/// Lightweight per-page metadata for decay ranking + GC (no body).
+#[derive(Debug, Clone)]
+pub struct PageMeta {
+    pub url:         String,
+    pub fetched_at:  DateTime<Utc>,
+    pub last_access: DateTime<Utc>,
+    pub salience:    f32,
+    pub pinned:      bool,
+}
+
 pub struct Cache {
     conn: Mutex<Connection>,
 }
@@ -194,11 +204,13 @@ impl Cache {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Record a cache hit: bump `last_access` + `access_count`.
+    /// Record a cache hit: bump `last_access` + `access_count`, and reinforce
+    /// salience (capped) — a re-read page earns standing against decay (ACT-R).
     pub fn touch_page(&self, url: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE pages SET last_access=?2, access_count=access_count+1 WHERE url=?1",
+            "UPDATE pages SET last_access=?2, access_count=access_count+1, \
+                    salience=MIN(1.0, salience+0.05) WHERE url=?1",
             params![url, Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -209,10 +221,40 @@ impl Cache {
     pub fn mark_fresh(&self, url: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE pages SET fetched_at=?2, last_access=?2, access_count=access_count+1 WHERE url=?1",
+            "UPDATE pages SET fetched_at=?2, last_access=?2, access_count=access_count+1, \
+                    salience=MIN(1.0, salience+0.05) WHERE url=?1",
             params![url, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Per-page metadata for decay ranking + GC.
+    pub fn all_page_meta(&self) -> anyhow::Result<Vec<PageMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, fetched_at, last_access, salience, pinned FROM pages",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)? as f32,
+                r.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (url, fetched_at, last_access, salience, pinned) = row?;
+            out.push(PageMeta {
+                url,
+                fetched_at: parse_ts(&fetched_at)?,
+                last_access: parse_ts(&last_access)?,
+                salience,
+                pinned,
+            });
+        }
+        Ok(out)
     }
 
     pub fn delete_page(&self, url: &str) -> anyhow::Result<bool> {
@@ -258,6 +300,18 @@ impl Cache {
     pub fn page_count(&self) -> i64 {
         self.conn.lock().unwrap()
             .query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Backdate a page's timestamps (RFC3339) — lets decay/GC tests age a page
+    /// without sleeping.
+    #[cfg(test)]
+    pub fn set_timestamps(&self, url: &str, fetched_at: &str, last_access: &str) {
+        self.conn.lock().unwrap()
+            .execute(
+                "UPDATE pages SET fetched_at=?2, last_access=?3 WHERE url=?1",
+                params![url, fetched_at, last_access],
+            )
+            .unwrap();
     }
 }
 

@@ -5,7 +5,7 @@
 //! does nothing is worse than one that says so).
 
 use clap::{Parser, Subcommand};
-use occipital::Config;
+use occipital::{Config, Engine};
 
 #[derive(Parser)]
 #[command(name = "occipital", version, about = "The agent's reading cortex — web search, fetch, recall, cache ops")]
@@ -41,8 +41,15 @@ fn main() -> anyhow::Result<()> {
             println!("robots:    {}", config.respect_robots);
             println!("rate/dom:  {} req/s", config.rate_per_domain);
         }
-        Command::Search { .. } | Command::Fetch { .. } | Command::Recall { .. } | Command::Gc => {
-            eprintln!("not implemented yet (Phase 0 scaffold) — see docs/build-roadmap.md");
+        Command::Gc => {
+            let engine = Engine::from_config(&config)?;
+            let pruned = engine.gc()?;
+            println!("garbage-collected {pruned} stale page(s)");
+        }
+        Command::Search { .. } | Command::Fetch { .. } | Command::Recall { .. } => {
+            // The live search/fetch/recall verbs land with the CLI surface (Phase 8);
+            // the MCP server is the primary interface today.
+            eprintln!("not implemented in the CLI yet (Phase 8) — use occipital-mcp");
             std::process::exit(2);
         }
     }

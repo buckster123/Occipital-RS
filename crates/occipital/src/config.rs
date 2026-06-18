@@ -21,6 +21,14 @@ pub const DEFAULT_SEARCH_TOP_N: usize = 5; // results fetched per search
 pub const DEFAULT_SEARCH_PROVIDER: &str = "duckduckgo";
 pub const DEFAULT_MAX_RETRIES: u32 = 3; // polite backoff retries on 429/503/transient
 
+// Decay / forgetting (Phase 6). Web content perishes faster than lived memory,
+// so the half-life is short by default. A cached page's standing halves every
+// `half_life` of *disuse*; below the GC floor (and unpinned, past min-age) it is
+// pruned — keeping recall sharp instead of flooded with stale pages.
+pub const DEFAULT_DECAY_HALFLIFE_SECS: u64 = 604_800; // 7 days
+pub const DEFAULT_GC_MIN_SALIENCE: f32 = 0.15; // prune below this effective salience
+pub const DEFAULT_GC_MIN_AGE_SECS: u64 = 86_400; // never GC a page fetched < 1 day ago
+
 // Compile-time guard: a conservative posture is the whole point — a careless
 // edit that makes the crawler aggressive must fail the build, not just a test.
 const _: () = assert!(DEFAULT_RATE_PER_DOMAIN <= 1.0, "default ≤ 1 req/s per domain");
@@ -54,6 +62,9 @@ pub struct Config {
     pub search_provider:    String,
     pub searxng_url:        Option<String>,
     pub max_retries:        u32,
+    pub decay_half_life_secs: u64,
+    pub gc_min_salience:    f32,
+    pub gc_min_age_secs:    u64,
 }
 
 impl Config {
@@ -76,6 +87,9 @@ impl Config {
                                     .unwrap_or_else(|_| DEFAULT_SEARCH_PROVIDER.to_string()),
             searxng_url:        env::var("OCCIPITAL_SEARXNG_URL").ok().filter(|s| !s.is_empty()),
             max_retries:        env_parse("OCCIPITAL_MAX_RETRIES", DEFAULT_MAX_RETRIES),
+            decay_half_life_secs: env_parse("OCCIPITAL_DECAY_HALFLIFE_SECS", DEFAULT_DECAY_HALFLIFE_SECS),
+            gc_min_salience:    env_parse("OCCIPITAL_GC_MIN_SALIENCE", DEFAULT_GC_MIN_SALIENCE),
+            gc_min_age_secs:    env_parse("OCCIPITAL_GC_MIN_AGE_SECS", DEFAULT_GC_MIN_AGE_SECS),
         })
     }
 
@@ -134,6 +148,9 @@ mod tests {
             search_provider:    DEFAULT_SEARCH_PROVIDER.to_string(),
             searxng_url:        None,
             max_retries:        DEFAULT_MAX_RETRIES,
+            decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
+            gc_min_salience:    DEFAULT_GC_MIN_SALIENCE,
+            gc_min_age_secs:    DEFAULT_GC_MIN_AGE_SECS,
         }
     }
 

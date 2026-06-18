@@ -4,13 +4,14 @@
 //! search providers, and a Cerebro-style decaying knowledge cache. Three thin
 //! binaries (`occipital-mcp` / `-api` / `-cli`) drive this one library.
 //!
-//! Build status: **Phase 5 — embeddings + semantic recall**. [`config`],
-//! [`ratelimit`], [`robots`], [`fetch`], [`extract`], [`providers`], [`cache`],
-//! [`embed`], and [`engine`] are live; decay/GC (Phase 6) is next. See
-//! `docs/build-roadmap.md`.
+//! Build status: **Phase 6 — decay & forgetting**. [`config`], [`ratelimit`],
+//! [`robots`], [`fetch`], [`extract`], [`providers`], [`cache`], [`embed`],
+//! [`decay`], and [`engine`] are live; the remaining phases are keyed providers,
+//! the API/CLI surfaces, and the ApexOS UI. See `docs/build-roadmap.md`.
 
 pub mod cache;
 pub mod config;
+pub mod decay;
 pub mod embed;
 pub mod engine;
 pub mod extract;
