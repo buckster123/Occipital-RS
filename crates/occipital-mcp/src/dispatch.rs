@@ -88,15 +88,17 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("query (non-empty string) required"))?;
             let limit = args["limit"].as_u64().map(|n| n as usize);
-            let results = engine.search(query, limit).await?;
+            let fresh = args["fresh"].as_bool().unwrap_or(false);
+            let (results, from_cache) = engine.search(query, limit, fresh).await?;
             // Flat, `kind`-discriminated result: it IS both the agent payload and
             // the follow-along view (docs/follow-along.md).
             Ok(json!({
-                "kind":     "results",
-                "query":    query,
-                "provider": engine.provider_name(),
-                "count":    results.len(),
-                "results":  results,
+                "kind":       "results",
+                "query":      query,
+                "provider":   engine.provider_name(),
+                "count":      results.len(),
+                "from_cache": from_cache,
+                "results":    results,
             }))
         }
         "web_fetch" => {
@@ -104,7 +106,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
-            let page = engine.fetch(url).await?;
+            let fresh = args["fresh"].as_bool().unwrap_or(false);
+            let (page, from_cache) = engine.fetch(url, fresh).await?;
             Ok(json!({
                 "kind":         "page",
                 "url":          page.url,
@@ -112,11 +115,34 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "markdown":     page.markdown,
                 "links":        page.links,
                 "content_hash": page.content_hash,
-                "from_cache":   false,
+                "from_cache":   from_cache,
             }))
         }
-        "web_recall" | "web_save" | "web_forget" => {
-            anyhow::bail!("tool not implemented yet (lands in the cache phases): {name}")
+        "web_save" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let page = engine.save(url).await?;
+            Ok(json!({
+                "kind":         "page",
+                "status":       "saved",
+                "pinned":       true,
+                "url":          page.url,
+                "title":        page.title,
+                "content_hash": page.content_hash,
+            }))
+        }
+        "web_forget" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required — query-based forget lands with recall"))?;
+            let removed = engine.forget(url)?;
+            Ok(json!({ "status": "ok", "url": url, "removed": removed }))
+        }
+        "web_recall" => {
+            anyhow::bail!("tool not implemented yet (lands with semantic recall): {name}")
         }
         _ => anyhow::bail!("tool not found: {name}"),
     }
@@ -135,17 +161,21 @@ mod tests {
     impl Fetcher for Canned {
         async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
             Ok(FetchResponse {
-                final_url:    url.to_string(),
-                status:       200,
-                content_type: None,
-                body:         self.0.clone(),
-                source:       Source::Network,
+                final_url:     url.to_string(),
+                status:        200,
+                content_type:  None,
+                etag:          None,
+                last_modified: None,
+                body:          self.0.clone(),
+                source:        Source::Network,
             })
         }
     }
 
     fn engine_with(body: &str) -> Arc<Engine> {
-        Arc::new(Engine::with_parts(Arc::new(Canned(body.as_bytes().to_vec())), Box::new(DuckDuckGo), 5))
+        let fetcher = Arc::new(Canned(body.as_bytes().to_vec()));
+        let cache = Arc::new(occipital::Cache::open_in_memory().unwrap());
+        Arc::new(Engine::with_parts(fetcher, Box::new(DuckDuckGo), Some(cache), 5, 3600))
     }
 
     #[test]

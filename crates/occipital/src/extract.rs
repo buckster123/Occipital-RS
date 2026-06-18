@@ -16,11 +16,11 @@ use std::collections::HashSet;
 
 use ego_tree::NodeRef;
 use scraper::{ElementRef, Html, Node, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// A link found in the main content, with its anchor text and absolute URL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
     pub text: String,
     pub url:  String,

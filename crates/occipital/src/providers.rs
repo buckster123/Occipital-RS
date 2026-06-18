@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use scraper::{Html, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::fetch::Fetcher;
 
 /// One ranked search hit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub title:   String,
     pub url:     String,

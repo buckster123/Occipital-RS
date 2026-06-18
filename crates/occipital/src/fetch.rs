@@ -25,11 +25,14 @@ pub enum Source {
 
 #[derive(Debug, Clone)]
 pub struct FetchResponse {
-    pub final_url:    String,
-    pub status:       u16,
-    pub content_type: Option<String>,
-    pub body:         Vec<u8>,
-    pub source:       Source,
+    pub final_url:     String,
+    pub status:        u16,
+    pub content_type:  Option<String>,
+    /// Validators captured from the response, for a later conditional refresh.
+    pub etag:          Option<String>,
+    pub last_modified: Option<String>,
+    pub body:          Vec<u8>,
+    pub source:        Source,
 }
 
 /// The fetch seam. Mock it to test everything above the network.
@@ -43,6 +46,19 @@ pub trait Fetcher: Send + Sync {
     /// Still throttled + concurrency-capped. Defaults to [`get`](Self::get) so
     /// mocks need not override it.
     async fn get_unchecked(&self, url: &str) -> anyhow::Result<FetchResponse> {
+        self.get(url).await
+    }
+
+    /// Conditional GET (robots-gated) for a cache refresh: sends `If-None-Match`
+    /// / `If-Modified-Since`. A `304` returns with `status == 304` and an empty
+    /// body. Defaults to a plain [`get`](Self::get) (always `200`) so a mock
+    /// without 304 support simply re-fetches — correct, just unoptimized.
+    async fn get_conditional(
+        &self,
+        url: &str,
+        _etag: Option<&str>,
+        _last_modified: Option<&str>,
+    ) -> anyhow::Result<FetchResponse> {
         self.get(url).await
     }
 }
@@ -122,14 +138,29 @@ impl PoliteFetcher {
         Ok(parsed)
     }
 
-    /// Throttle → concurrency permit → send with polite backoff on 429/503. The
-    /// robots check is the caller's responsibility (so provider API calls skip it).
-    async fn send(&self, parsed: Url) -> anyhow::Result<FetchResponse> {
+    /// Throttle → concurrency permit → send with polite backoff on 429/503,
+    /// optionally with conditional-GET validators. The robots check is the
+    /// caller's responsibility (so provider API calls skip it). A `304` is
+    /// returned as-is (empty body) — not retried.
+    async fn send_with(
+        &self,
+        parsed: Url,
+        conditional: Option<(Option<&str>, Option<&str>)>,
+    ) -> anyhow::Result<FetchResponse> {
         self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
         let mut attempt = 0u32;
         loop {
-            match self.client.get(parsed.clone()).send().await {
+            let mut req = self.client.get(parsed.clone());
+            if let Some((etag, last_modified)) = conditional {
+                if let Some(e) = etag {
+                    req = req.header(reqwest::header::IF_NONE_MATCH, e);
+                }
+                if let Some(lm) = last_modified {
+                    req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+                }
+            }
+            match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     if (status.as_u16() == 429 || status.as_u16() == 503) && attempt < self.max_retries {
@@ -145,18 +176,22 @@ impl PoliteFetcher {
                             anyhow::bail!("body too large: {len} bytes > cap {}", self.max_body_bytes);
                         }
                     }
+                    let header = |h: reqwest::header::HeaderName| {
+                        resp.headers().get(h).and_then(|v| v.to_str().ok()).map(String::from)
+                    };
                     let final_url = resp.url().to_string();
-                    let content_type = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                    let content_type = header(reqwest::header::CONTENT_TYPE);
+                    let etag = header(reqwest::header::ETAG);
+                    let last_modified = header(reqwest::header::LAST_MODIFIED);
+                    let status_u16 = status.as_u16();
                     let mut body = resp.bytes().await?.to_vec();
                     body.truncate(self.max_body_bytes); // backstop for chunked/no-length
                     return Ok(FetchResponse {
                         final_url,
-                        status: status.as_u16(),
+                        status: status_u16,
                         content_type,
+                        etag,
+                        last_modified,
                         body,
                         source: Source::Network,
                     });
@@ -197,12 +232,23 @@ impl Fetcher for PoliteFetcher {
     async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
         let parsed = Self::parse_http(url)?;
         self.robots_gate(&parsed, url).await?;
-        self.send(parsed).await
+        self.send_with(parsed, None).await
     }
 
     async fn get_unchecked(&self, url: &str) -> anyhow::Result<FetchResponse> {
         let parsed = Self::parse_http(url)?;
-        self.send(parsed).await
+        self.send_with(parsed, None).await
+    }
+
+    async fn get_conditional(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> anyhow::Result<FetchResponse> {
+        let parsed = Self::parse_http(url)?;
+        self.robots_gate(&parsed, url).await?;
+        self.send_with(parsed, Some((etag, last_modified))).await
     }
 }
 
