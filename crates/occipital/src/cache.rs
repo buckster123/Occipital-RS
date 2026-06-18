@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS searches (
     results    TEXT NOT NULL,               -- JSON array of SearchResult
     fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS embeddings (
+    url TEXT PRIMARY KEY,
+    vec BLOB NOT NULL                       -- little-endian f32s (Micro+ only)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, markdown);
 "#;
 
 impl Cache {
@@ -145,7 +150,48 @@ impl Cache {
                 etag, last_modified, now, pinned as i64
             ],
         )?;
+        // Keep the FTS keyword index in sync (delete-then-insert; FTS5 has no upsert).
+        conn.execute("DELETE FROM pages_fts WHERE url=?1", params![page.url])?;
+        conn.execute(
+            "INSERT INTO pages_fts (url, title, markdown) VALUES (?1,?2,?3)",
+            params![page.url, page.title, page.markdown],
+        )?;
         Ok(())
+    }
+
+    /// Store a page's embedding vector (Micro+). Replaces any prior vector.
+    pub fn put_embedding(&self, url: &str, vec: &[f32]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (url, vec) VALUES (?1, ?2)",
+            params![url, vec_to_blob(vec)],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored `(url, vector)` — brute-force cosine search loads these. Fine
+    /// at cache scale; an ANN index (sqlite-vec) is the scale refinement.
+    pub fn all_embeddings(&self) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT url, vec FROM embeddings")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, blob_to_vec(&r.get::<_, Vec<u8>>(1)?)))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// FTS5 keyword search over cached pages → matching urls, best-ranked first.
+    pub fn keyword_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        let m = fts_query(query);
+        if m.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url FROM pages_fts WHERE pages_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![m, limit as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Record a cache hit: bump `last_access` + `access_count`.
@@ -171,7 +217,10 @@ impl Cache {
 
     pub fn delete_page(&self, url: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM pages WHERE url=?1", params![url])? > 0)
+        let removed = conn.execute("DELETE FROM pages WHERE url=?1", params![url])? > 0;
+        conn.execute("DELETE FROM pages_fts WHERE url=?1", params![url])?;
+        conn.execute("DELETE FROM embeddings WHERE url=?1", params![url])?;
+        Ok(removed)
     }
 
     pub fn set_pinned(&self, url: &str, pinned: bool) -> anyhow::Result<bool> {
@@ -214,6 +263,25 @@ impl Cache {
 
 fn parse_ts(s: &str) -> anyhow::Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
+}
+
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// Build a safe FTS5 MATCH expression: alphanumeric tokens, each quoted (so
+/// punctuation/operators can't break the syntax), OR-joined for recall breadth.
+fn fts_query(query: &str) -> String {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 #[cfg(test)]
@@ -263,6 +331,31 @@ mod tests {
         assert!(c.delete_page("https://e.test/").unwrap());
         assert!(c.get_page("https://e.test/").unwrap().is_none());
         assert!(!c.delete_page("https://e.test/").unwrap(), "second delete is a no-op");
+    }
+
+    #[test]
+    fn keyword_search_finds_pages_by_token() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/rust", "the rust programming language is fast"), None, None, false).unwrap();
+        c.put_page(&page("https://e.test/bread", "sourdough bread baking guide"), None, None, false).unwrap();
+        let hits = c.keyword_search("rust language", 5).unwrap();
+        assert_eq!(hits, vec!["https://e.test/rust".to_string()]);
+        assert!(c.keyword_search("nonexistentword", 5).unwrap().is_empty());
+        assert!(c.keyword_search("", 5).unwrap().is_empty(), "empty query → no match, no syntax error");
+    }
+
+    #[test]
+    fn embedding_roundtrips_and_delete_clears_it() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/x", "body"), None, None, false).unwrap();
+        c.put_embedding("https://e.test/x", &[0.1, -0.2, 0.3]).unwrap();
+        let all = c.all_embeddings().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "https://e.test/x");
+        assert!((all[0].1[1] - (-0.2)).abs() < 1e-6, "f32 blob roundtrips");
+        c.delete_page("https://e.test/x").unwrap();
+        assert!(c.all_embeddings().unwrap().is_empty(), "delete clears the embedding");
+        assert!(c.keyword_search("body", 5).unwrap().is_empty(), "delete clears the FTS row");
     }
 
     #[test]

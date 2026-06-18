@@ -83,8 +83,14 @@ docs/               # design docs (this is the planning lock-in)
 
 | Tier | Embeddings | Cache | Search |
 |------|-----------|-------|--------|
-| Nano | off (`OCCIPITAL_EMBED_MODEL=""`) | FTS5 keyword only | scrape providers |
-| Micro+ | bge-small (~+250 MB RSS) | cosine semantic + FTS5 | scrape + keyed (if keys) |
+| Nano | off (default build) | FTS5 keyword only | scrape providers |
+| Micro+ | bge-small, build `--features embeddings` + set `OCCIPITAL_EMBED_MODEL` | cosine semantic + FTS5 | scrape + keyed (if keys) |
+
+**Embeddings are an opt-in build feature**, not just a runtime toggle: the default
+build excludes the ONNX runtime (`fastembed`) entirely — smaller binary, no build-time
+download, Nano-friendly. Micro+ nodes build `cargo build --features embeddings` (or
+`-p occipital-mcp --features embeddings`) **and** set `OCCIPITAL_EMBED_MODEL`. Without
+the feature, a set model is ignored (warned) and recall is FTS5 keyword.
 
 **Design rule (inherited from ApexOS):** build for Nano first — graceful when embeddings are
 off, no timeouts shorter than 30s, never assume a key is present.

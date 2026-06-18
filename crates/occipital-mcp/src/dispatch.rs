@@ -142,7 +142,18 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             Ok(json!({ "status": "ok", "url": url, "removed": removed }))
         }
         "web_recall" => {
-            anyhow::bail!("tool not implemented yet (lands with semantic recall): {name}")
+            let query = args["query"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("query (non-empty string) required"))?;
+            let limit = args["limit"].as_u64().map(|n| n as usize);
+            let hits = engine.recall(query, limit).await?;
+            Ok(json!({
+                "kind":  "recall",
+                "query": query,
+                "count": hits.len(),
+                "hits":  hits,
+            }))
         }
         _ => anyhow::bail!("tool not found: {name}"),
     }
@@ -233,12 +244,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_tool_returns_honest_not_implemented_not_a_success() {
+    async fn web_recall_returns_a_recall_payload() {
+        // Empty cache → zero hits, but a well-formed recall result (not an error).
         let msg = json!({"jsonrpc":"2.0","id":6,"method":"tools/call",
-            "params":{"name":"web_recall","arguments":{"query":"x"}}});
+            "params":{"name":"web_recall","arguments":{"query":"rust"}}});
         let resp = dispatch_tool(msg, engine_with("")).await;
-        assert!(resp["result"].is_null(), "must NOT report success for an unimplemented tool");
-        assert!(resp["error"]["message"].as_str().unwrap().contains("not implemented"));
+        assert!(resp["error"].is_null(), "recall should not error: {}", resp["error"]);
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "recall");
+        assert_eq!(out["count"], 0);
     }
 
     #[tokio::test]

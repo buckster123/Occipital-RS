@@ -9,6 +9,10 @@ license.workspace = true
 name = "occipital-mcp"
 path = "src/main.rs"
 
+[features]
+# Forwards to the lib: build with `--features embeddings` for Micro+ semantic recall.
+embeddings = ["occipital/embeddings"]
+
 [dependencies]
 occipital        = { path = "../occipital" }
 tokio.workspace  = true

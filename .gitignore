@@ -5,3 +5,7 @@ Cargo.lock
 *.db-journal
 *.db-wal
 .env
+
+# fastembed model cache (downloaded at runtime, never committed)
+.fastembed_cache/
+**/.fastembed_cache/

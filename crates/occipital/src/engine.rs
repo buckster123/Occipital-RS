@@ -6,17 +6,30 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Page};
 use crate::fetch::{Fetcher, PoliteFetcher};
 use crate::providers::{provider_for, SearchProvider, SearchResult};
+
+/// One hit from `web_recall` over already-read pages.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallHit {
+    pub url:     String,
+    pub title:   Option<String>,
+    pub snippet: String,
+    /// Cosine score (semantic recall) or `None` (FTS5 keyword recall).
+    pub score:   Option<f32>,
+}
 
 pub struct Engine {
     fetcher:        Arc<dyn Fetcher>,
     provider:       Box<dyn SearchProvider>,
     cache:          Option<Arc<Cache>>,
+    embedder:       Option<Arc<dyn Embedder>>,
     top_n:          usize,
     fresh_ttl_secs: u64,
 }
@@ -36,12 +49,14 @@ impl Engine {
             fetcher,
             provider: provider_for(cfg),
             cache,
+            embedder: make_embedder(&cfg.embed_model),
             top_n: cfg.search_top_n,
             fresh_ttl_secs: cfg.fresh_ttl_secs,
         })
     }
 
-    /// Inject parts directly (tests / custom embeddings).
+    /// Inject parts directly (tests / custom embeddings). Embedder defaults to
+    /// none (FTS5 recall) — add one with [`with_embedder`](Self::with_embedder).
     pub fn with_parts(
         fetcher: Arc<dyn Fetcher>,
         provider: Box<dyn SearchProvider>,
@@ -49,11 +64,34 @@ impl Engine {
         top_n: usize,
         fresh_ttl_secs: u64,
     ) -> Self {
-        Self { fetcher, provider, cache, top_n, fresh_ttl_secs }
+        Self { fetcher, provider, cache, embedder: None, top_n, fresh_ttl_secs }
+    }
+
+    pub fn with_embedder(mut self, embedder: Option<Arc<dyn Embedder>>) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     pub fn provider_name(&self) -> &str {
         self.provider.name()
+    }
+
+    /// Store a freshly-fetched page in the cache + (if embeddings are on) index
+    /// its vector. No-op without a cache. Sync — never holds a lock across await.
+    fn index(&self, page: &Page, etag: Option<&str>, last_modified: Option<&str>, pinned: bool) -> anyhow::Result<()> {
+        let Some(cache) = &self.cache else { return Ok(()) };
+        cache.put_page(page, etag, last_modified, pinned)?;
+        if let Some(embedder) = &self.embedder {
+            match embedder.embed(&embed_text(page)) {
+                Ok(v) => {
+                    if let Err(e) = cache.put_embedding(&page.url, &v) {
+                        tracing::warn!("embedding store failed for {}: {e}", page.url);
+                    }
+                }
+                Err(e) => tracing::warn!("embed failed for {}: {e}", page.url),
+            }
+        }
+        Ok(())
     }
 
     fn is_fresh(&self, fetched_at: DateTime<Utc>) -> bool {
@@ -120,9 +158,7 @@ impl Engine {
                     return Ok((row.page.clone(), true));
                 }
                 let page = extract_bytes(&resp.body, &resp.final_url);
-                if let Some(c) = &self.cache {
-                    c.put_page(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), row.pinned)?;
-                }
+                self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), row.pinned)?;
                 return Ok((page, false));
             }
         }
@@ -131,9 +167,7 @@ impl Engine {
         let resp = self.fetcher.get(url).await?;
         let page = extract_bytes(&resp.body, &resp.final_url);
         let pinned = existing.as_ref().map(|r| r.pinned).unwrap_or(false);
-        if let Some(c) = &self.cache {
-            c.put_page(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), pinned)?;
-        }
+        self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), pinned)?;
         Ok((page, false))
     }
 
@@ -141,10 +175,42 @@ impl Engine {
     pub async fn save(&self, url: &str) -> anyhow::Result<Page> {
         let resp = self.fetcher.get(url).await?;
         let page = extract_bytes(&resp.body, &resp.final_url);
-        if let Some(c) = &self.cache {
-            c.put_page(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), true)?;
-        }
+        self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), true)?;
         Ok(page)
+    }
+
+    /// Recall over **already-read** pages only (no live web). Semantic (cosine)
+    /// when embeddings are on, FTS5 keyword otherwise. Returns ranked hits.
+    pub async fn recall(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<RecallHit>> {
+        if query.trim().is_empty() {
+            anyhow::bail!("empty query");
+        }
+        let n = limit.unwrap_or(self.top_n).clamp(1, 50);
+        let Some(cache) = &self.cache else { return Ok(Vec::new()) };
+
+        let ranked: Vec<(String, Option<f32>)> = if let Some(embedder) = &self.embedder {
+            let qv = embedder.embed(query)?;
+            let mut scored: Vec<(String, f32)> =
+                cache.all_embeddings()?.into_iter().map(|(u, v)| (u, cosine(&qv, &v))).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(n);
+            scored.into_iter().map(|(u, s)| (u, Some(s))).collect()
+        } else {
+            cache.keyword_search(query, n)?.into_iter().map(|u| (u, None)).collect()
+        };
+
+        let mut hits = Vec::new();
+        for (url, score) in ranked {
+            if let Some(row) = cache.get_page(&url)? {
+                hits.push(RecallHit {
+                    url,
+                    title: row.page.title,
+                    snippet: snippet(&row.page.markdown),
+                    score,
+                });
+            }
+        }
+        Ok(hits)
     }
 
     /// Evict a URL from the cache. `false` if it wasn't cached (or no cache).
@@ -160,6 +226,27 @@ impl Engine {
 /// hits regardless of casing/whitespace.
 fn search_key(provider: &str, query: &str, limit: usize) -> String {
     format!("{provider}|{limit}|{}", query.trim().to_lowercase())
+}
+
+/// Text fed to the embedder: title + body, capped (bge truncates internally, but
+/// a bounded input keeps embedding cheap). Char-boundary safe.
+fn embed_text(page: &Page) -> String {
+    let mut t = page.title.clone().unwrap_or_default();
+    t.push('\n');
+    t.push_str(&page.markdown);
+    truncate_chars(&t, 2000).to_string()
+}
+
+/// A short preview of a page body for a recall hit.
+fn snippet(markdown: &str) -> String {
+    truncate_chars(markdown.trim(), 220).to_string()
+}
+
+fn truncate_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +351,66 @@ mod tests {
         e.save("https://e.test/").await.unwrap();
         assert!(e.forget("https://e.test/").unwrap(), "saved page can be forgotten");
         assert!(!e.forget("https://e.test/").unwrap(), "second forget is a no-op");
+    }
+
+    // ---- recall ----------------------------------------------------------
+
+    use crate::embed::{BagOfWordsEmbedder, Embedder};
+    use crate::extract::Page;
+
+    fn mkpage(url: &str, body: &str) -> Page {
+        Page {
+            url: url.into(),
+            title: Some(url.into()),
+            byline: None,
+            markdown: body.into(),
+            links: vec![],
+            content_hash: "h".into(),
+        }
+    }
+
+    /// Build a cache-only engine (fetcher unused) and populate the cache + (if
+    /// `embedder`) the vectors directly — recall reads only the cache.
+    fn recall_engine(pages: &[(&str, &str)], embedder: Option<Arc<dyn Embedder>>) -> Engine {
+        let cache = Arc::new(Cache::open_in_memory().unwrap());
+        for (url, body) in pages {
+            let page = mkpage(url, body);
+            cache.put_page(&page, None, None, false).unwrap();
+            if let Some(e) = &embedder {
+                cache.put_embedding(url, &e.embed(body).unwrap()).unwrap();
+            }
+        }
+        Engine::with_parts(Counting::new(""), Box::new(DuckDuckGo), Some(cache), 5, 3600)
+            .with_embedder(embedder)
+    }
+
+    #[tokio::test]
+    async fn recall_semantic_ranks_by_similarity() {
+        let emb: Arc<dyn Embedder> = Arc::new(BagOfWordsEmbedder::new());
+        let e = recall_engine(
+            &[
+                ("https://e.test/rust", "rust async await tokio runtime concurrency"),
+                ("https://e.test/bread", "sourdough bread baking flour yeast oven"),
+            ],
+            Some(emb),
+        );
+        let hits = e.recall("async rust tokio", Some(2)).await.unwrap();
+        assert_eq!(hits[0].url, "https://e.test/rust", "most similar page ranks first");
+        assert!(hits[0].score.unwrap() > hits[1].score.unwrap(), "scored, descending");
+    }
+
+    #[tokio::test]
+    async fn recall_keyword_fallback_without_embedder() {
+        let e = recall_engine(
+            &[
+                ("https://e.test/rust", "the rust programming language"),
+                ("https://e.test/bread", "sourdough bread baking"),
+            ],
+            None, // Nano: FTS5 keyword recall
+        );
+        let hits = e.recall("rust language", Some(5)).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://e.test/rust");
+        assert!(hits[0].score.is_none(), "keyword recall has no cosine score");
     }
 }
