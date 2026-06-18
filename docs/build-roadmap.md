@@ -6,7 +6,7 @@ clippy-clean, tests per crate, build incrementally.
 
 | Phase | Feature | Gate | Status |
 |-------|---------|------|--------|
-| 0 | **Scaffold** — Cargo workspace (`occipital` + `-mcp`/`-api`/`-cli`), config module, tier detection, CI clippy-clean | `cargo build --workspace` green; `occipital-mcp` does the MCP handshake (initialize/tools-list) | ☐ |
+| 0 | **Scaffold** — Cargo workspace (`occipital` + `-mcp`/`-api`/`-cli`), config module, tier detection, CI clippy-clean | `cargo build --workspace` green; `occipital-mcp` does the MCP handshake (initialize/tools-list) | ✓ — workspace builds; `occipital-mcp` handshake + 5-tool `tools/list` live (honest not-implemented `tools/call`); `Config::from_env` + Nano/Micro tier + compile-time polite-defaults guard; CLI `status`; `-api` `/health`; 9 tests, clippy `-D warnings` clean; CI workflow added |
 | 1 | **Polite fetcher** — `Fetcher` trait, `reqwest` client, per-domain token bucket + jitter + concurrency cap + backoff, robots cache, honest UA | fetch a URL; an integration test proves N requests to one domain are spaced ≥ the interval; robots `Disallow` honored | ☐ |
 | 2 | **Reader-mode** — HTML → `Page{title,markdown,links,content_hash}` | a real page returns clean markdown + a sane link list, no chrome; emoji/CJK safe | ☐ |
 | 3 | **Search providers** — `SearchProvider` trait + `duckduckgo` (HTML) + `searxng` (JSON); `web_search`/`web_fetch` MCP tools | `web_search("…")` returns ranked results live; `web_fetch` returns reader-mode | ☐ |

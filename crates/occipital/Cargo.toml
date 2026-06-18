@@ -1,0 +1,15 @@
+[package]
+name        = "occipital"
+description = "The agent's reading cortex — polite web fetch, reader-mode, search providers, and a decaying knowledge cache"
+version.workspace = true
+edition     = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace    = true
+tracing.workspace   = true
+dirs-next.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

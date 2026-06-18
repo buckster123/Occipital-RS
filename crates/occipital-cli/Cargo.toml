@@ -1,0 +1,16 @@
+[package]
+name        = "occipital-cli"
+description = "Occipital CLI — search, fetch, recall, cache ops, provider keys"
+version.workspace = true
+edition     = "2021"
+license.workspace = true
+
+[[bin]]
+name = "occipital"
+path = "src/main.rs"
+
+[dependencies]
+occipital        = { path = "../occipital" }
+clap.workspace   = true
+anyhow.workspace = true
+tokio.workspace  = true

@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/occipital",
+    "crates/occipital-mcp",
+    "crates/occipital-api",
+    "crates/occipital-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version    = "0.1.0"
+authors    = ["buckster123"]
+edition    = "2021"
+license    = "MIT"
+repository = "https://github.com/buckster123/Occipital-RS"
+
+[workspace.dependencies]
+# Async
+tokio       = { version = "1", features = ["full"] }
+# Serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+# Storage (the read-through cache) — same stack as Cerebro
+rusqlite    = { version = "0.31", features = ["bundled", "blob"] }
+sqlite-vec  = "0.1"
+# Embeddings (ONNX, no GPU) — gated by OCCIPITAL_EMBED_MODEL (Nano = off)
+fastembed   = "4"
+# HTTP — rustls (no OpenSSL link dep, Pi/cross-compile friendly), gzip
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# URL canonicalization
+url         = "2"
+# HTML parsing (reader-mode extraction)
+scraper     = "0.19"
+# Per-domain rate limiting
+governor    = "0.6"
+# REST (occipital-api)
+axum        = "0.7"
+tower       = "0.4"
+# CLI (occipital-cli)
+clap        = { version = "4", features = ["derive", "env"] }
+# UUIDs
+uuid        = { version = "1", features = ["v4", "serde"] }
+# Time
+chrono      = { version = "0.4", features = ["serde"] }
+# Errors
+anyhow      = "1"
+thiserror   = "1"
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Jitter
+rand        = "0.8"
+# Filesystem dirs
+dirs-next   = "2"
+# Temp dirs (tests)
+tempfile    = "3"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+strip     = true
+
+[profile.dev]
+opt-level = 0
+debug     = true
