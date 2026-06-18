@@ -20,7 +20,7 @@ pub mod providers;
 pub mod ratelimit;
 pub mod robots;
 
-pub use cache::Cache;
+pub use cache::{Cache, CacheStats};
 pub use config::{Config, Tier};
 pub use embed::{cosine, make_embedder, Embedder};
 pub use engine::{Engine, RecallHit};

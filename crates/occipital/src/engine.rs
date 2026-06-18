@@ -304,6 +304,16 @@ impl Engine {
             None => Ok(false),
         }
     }
+
+    /// Cache size counters (`None` if no cache).
+    pub fn stats(&self) -> Option<crate::cache::CacheStats> {
+        self.cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Whether semantic recall is active (embeddings loaded) vs FTS5 keyword.
+    pub fn semantic(&self) -> bool {
+        self.embedder.is_some()
+    }
 }
 
 /// Cache key for a search: provider + limit + normalized query, so the same ask

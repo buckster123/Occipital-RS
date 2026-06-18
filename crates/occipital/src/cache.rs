@@ -13,9 +13,19 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 
 use crate::extract::{Link, Page};
 use crate::providers::SearchResult;
+
+/// Cache size counters (for `stats`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheStats {
+    pub pages:      i64,
+    pub pinned:     i64,
+    pub embeddings: i64,
+    pub searches:   i64,
+}
 
 /// A cached page plus the metadata the read-through needs (validators for a
 /// conditional refresh, `fetched_at` for freshness, `pinned` to survive decay).
@@ -284,6 +294,18 @@ impl Cache {
         let Some((results_json, fetched_at)) = row else { return Ok(None) };
         let results: Vec<SearchResult> = serde_json::from_str(&results_json).unwrap_or_default();
         Ok(Some((results, parse_ts(&fetched_at)?)))
+    }
+
+    /// Size counters across the store.
+    pub fn stats(&self) -> CacheStats {
+        let conn = self.conn.lock().unwrap();
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        CacheStats {
+            pages:      count("SELECT COUNT(*) FROM pages"),
+            pinned:     count("SELECT COUNT(*) FROM pages WHERE pinned=1"),
+            embeddings: count("SELECT COUNT(*) FROM embeddings"),
+            searches:   count("SELECT COUNT(*) FROM searches"),
+        }
     }
 
     pub fn put_search(&self, key: &str, query: &str, results: &[SearchResult]) -> anyhow::Result<()> {

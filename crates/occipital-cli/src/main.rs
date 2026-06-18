@@ -43,11 +43,40 @@ enum KeysAction {
     Rm { provider: String },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::from_env()?;
 
     match cli.command {
+        Command::Search { query } => {
+            let engine = Engine::from_config(&config)?;
+            let (results, from_cache) = engine.search(&query, None, false).await?;
+            println!("# {} results via {}{}", results.len(), engine.provider_name(),
+                if from_cache { " [cached]" } else { "" });
+            for r in &results {
+                println!("\n{}. {}\n   {}\n   {}", r.rank + 1, r.title, r.url, r.snippet);
+            }
+        }
+        Command::Fetch { url } => {
+            let engine = Engine::from_config(&config)?;
+            let (page, from_cache) = engine.fetch(&url, false).await?;
+            if from_cache {
+                eprintln!("[served from cache]");
+            }
+            println!("{}", page.markdown);
+        }
+        Command::Recall { query } => {
+            let engine = Engine::from_config(&config)?;
+            let hits = engine.recall(&query, None).await?;
+            if hits.is_empty() {
+                println!("(nothing recalled)");
+            }
+            for h in &hits {
+                let score = h.score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "—".into());
+                println!("{score}  {}\n   {}\n", h.url, h.snippet);
+            }
+        }
         Command::Status => {
             println!("occipital {}", occipital::version());
             println!("tier:      {:?}", config.tier());
@@ -87,12 +116,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-        }
-        Command::Search { .. } | Command::Fetch { .. } | Command::Recall { .. } => {
-            // The live search/fetch/recall verbs land with the CLI surface (Phase 8);
-            // the MCP server is the primary interface today.
-            eprintln!("not implemented in the CLI yet (Phase 8) — use occipital-mcp");
-            std::process::exit(2);
         }
     }
     Ok(())
