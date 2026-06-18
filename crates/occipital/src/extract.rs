@@ -16,17 +16,18 @@ use std::collections::HashSet;
 
 use ego_tree::NodeRef;
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::Serialize;
 use url::Url;
 
 /// A link found in the main content, with its anchor text and absolute URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Link {
     pub text: String,
     pub url:  String,
 }
 
 /// The reader-mode result for one page.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Page {
     pub url:          String,
     pub title:        Option<String>,

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use occipital::Config;
+use occipital::Engine;
 use serde_json::{json, Value};
 
 use crate::tools;
@@ -45,14 +45,14 @@ pub fn tools_list(req: &Value) -> Value {
 
 /// Route a `tools/call`, isolating handler panics on a dedicated task so a fault
 /// can never unwind into the main loop and take the daemon down.
-pub async fn dispatch_tool(msg: Value, config: Arc<Config>) -> Value {
+pub async fn dispatch_tool(msg: Value, engine: Arc<Engine>) -> Value {
     let id = msg["id"].clone();
 
     let handle = tokio::spawn(async move {
         let params = &msg["params"];
         let name = params["name"].as_str().unwrap_or("").to_string();
         let args = params["arguments"].clone();
-        route(&name, &args, config).await
+        route(&name, &args, engine).await
     });
 
     match handle.await {
@@ -77,12 +77,46 @@ pub async fn dispatch_tool(msg: Value, config: Arc<Config>) -> Value {
     }
 }
 
-/// The tool router. Phase 0: known tools return an honest not-implemented error
-/// (NOT a success stub — that would read as "it worked"); unknown tools error too.
-async fn route(name: &str, _args: &Value, _config: Arc<Config>) -> anyhow::Result<Value> {
+/// The tool router. `web_search` + `web_fetch` are live; the cache-backed tools
+/// (`web_recall` / `web_save` / `web_forget`) return an honest not-implemented
+/// error (NOT a success stub) until the cache phases; unknown tools error too.
+async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<Value> {
     match name {
-        "web_search" | "web_fetch" | "web_recall" | "web_save" | "web_forget" => {
-            anyhow::bail!("tool not implemented yet (Phase 0 scaffold): {name}")
+        "web_search" => {
+            let query = args["query"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("query (non-empty string) required"))?;
+            let limit = args["limit"].as_u64().map(|n| n as usize);
+            let results = engine.search(query, limit).await?;
+            // Flat, `kind`-discriminated result: it IS both the agent payload and
+            // the follow-along view (docs/follow-along.md).
+            Ok(json!({
+                "kind":     "results",
+                "query":    query,
+                "provider": engine.provider_name(),
+                "count":    results.len(),
+                "results":  results,
+            }))
+        }
+        "web_fetch" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let page = engine.fetch(url).await?;
+            Ok(json!({
+                "kind":         "page",
+                "url":          page.url,
+                "title":        page.title,
+                "markdown":     page.markdown,
+                "links":        page.links,
+                "content_hash": page.content_hash,
+                "from_cache":   false,
+            }))
+        }
+        "web_recall" | "web_save" | "web_forget" => {
+            anyhow::bail!("tool not implemented yet (lands in the cache phases): {name}")
         }
         _ => anyhow::bail!("tool not found: {name}"),
     }
@@ -91,9 +125,27 @@ async fn route(name: &str, _args: &Value, _config: Arc<Config>) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use occipital::fetch::{FetchResponse, Fetcher, Source};
+    use occipital::providers::DuckDuckGo;
 
-    fn cfg() -> Arc<Config> {
-        Arc::new(Config::from_env().unwrap())
+    /// A fetcher returning a fixed body — drives the engine without a network.
+    struct Canned(Vec<u8>);
+    #[async_trait]
+    impl Fetcher for Canned {
+        async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
+            Ok(FetchResponse {
+                final_url:    url.to_string(),
+                status:       200,
+                content_type: None,
+                body:         self.0.clone(),
+                source:       Source::Network,
+            })
+        }
+    }
+
+    fn engine_with(body: &str) -> Arc<Engine> {
+        Arc::new(Engine::with_parts(Arc::new(Canned(body.as_bytes().to_vec())), Box::new(DuckDuckGo), 5))
     }
 
     #[test]
@@ -116,19 +168,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_tool_returns_honest_not_implemented_not_a_success() {
+    async fn web_search_returns_ranked_results() {
+        let ddg = r#"<div class="result"><div class="links_main">
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F">Rust</a>
+            <a class="result__snippet">A safe language.</a></div></div>"#;
         let msg = json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"web_search","arguments":{"query":"x"}}});
-        let resp = dispatch_tool(msg, cfg()).await;
+            "params":{"name":"web_search","arguments":{"query":"rust"}}});
+        let resp = dispatch_tool(msg, engine_with(ddg)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "results");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["results"][0]["url"], "https://rust-lang.org/");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_returns_reader_mode() {
+        let html = "<html><head><title>T</title></head><body><main><h1>Hi</h1><p>body</p></main></body></html>";
+        let msg = json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"web_fetch","arguments":{"url":"https://example.com/p"}}});
+        let resp = dispatch_tool(msg, engine_with(html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "page");
+        assert_eq!(out["title"], "T");
+        assert!(out["markdown"].as_str().unwrap().contains("# Hi"));
+    }
+
+    #[tokio::test]
+    async fn web_search_requires_a_query() {
+        let msg = json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"web_search","arguments":{}}});
+        let resp = dispatch_tool(msg, engine_with("")).await;
+        assert!(resp["result"].is_null());
+        assert!(resp["error"]["message"].as_str().unwrap().contains("query"));
+    }
+
+    #[tokio::test]
+    async fn cache_tool_returns_honest_not_implemented_not_a_success() {
+        let msg = json!({"jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"web_recall","arguments":{"query":"x"}}});
+        let resp = dispatch_tool(msg, engine_with("")).await;
         assert!(resp["result"].is_null(), "must NOT report success for an unimplemented tool");
         assert!(resp["error"]["message"].as_str().unwrap().contains("not implemented"));
     }
 
     #[tokio::test]
     async fn unknown_tool_errors() {
-        let msg = json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+        let msg = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
             "params":{"name":"definitely_not_a_tool","arguments":{}}});
-        let resp = dispatch_tool(msg, cfg()).await;
+        let resp = dispatch_tool(msg, engine_with("")).await;
         assert!(resp["error"]["message"].as_str().unwrap().contains("not found"));
     }
 }

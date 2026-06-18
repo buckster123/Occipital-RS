@@ -10,29 +10,28 @@ Occipital never knows about Slint or agentd. It just returns, with every `web_fe
 result, a **structured view payload** a consumer *may* render. A pure-MCP client ignores it; the
 ApexOS desktop renders it as a follow-along browser.
 
-## The view payload (Occipital → consumer)
+## The result payload (Occipital → consumer)
 
-Every `web_fetch` / `web_search` tool result carries, alongside the agent-facing text, a
-`view` object:
+Every `web_fetch` / `web_search` tool result is a **flat, `kind`-discriminated** JSON object —
+it *is* both the agent payload and the follow-along view (no separate nested `view` object; the
+markdown isn't duplicated). The `kind` field selects how a UI renders it. As shipped in Phase 3:
 
-```json
-{
-  "view": {
-    "kind": "page",                  // "page" | "results"
-    "url": "https://example.com/x",
-    "title": "…",
-    "markdown": "# … reader-mode body …",
-    "links": [{"text": "Next", "url": "https://…"}],
-    "fetched_at": "2026-…",
-    "from_cache": true
-  }
-}
+```jsonc
+// web_fetch
+{ "kind": "page", "url": "https://example.com/x", "title": "…",
+  "markdown": "# … reader-mode body …",
+  "links": [{"text": "Next", "url": "https://…"}],
+  "content_hash": "…", "from_cache": false }
+
+// web_search
+{ "kind": "results", "query": "…", "provider": "duckduckgo", "count": 3,
+  "results": [{"title": "…", "url": "https://…", "snippet": "…", "rank": 0}] }
 ```
 
-For `web_search`, `kind: "results"` with `results: [{title, url, snippet, rank}]` and the
-`markdown` is a rendered result list. This mirrors how ApexOS's `display_face` / `sketch_snapshot`
-tools already pass a side-channel the UI consumes directly from the `tool_requested` event —
-**no new agentd event type needed**: the UI reads `view` off the Occipital tool call.
+(The cache phases add `from_cache`/freshness to `results` too.) This mirrors how ApexOS's
+`display_face` / `sketch_snapshot` tools already pass a side-channel the UI consumes directly from
+the `tool_requested` event — **no new agentd event type needed**: the UI reads the Occipital tool
+result and switches on `kind`.
 
 ## Rendering in ApexOS-RS (Slint)
 

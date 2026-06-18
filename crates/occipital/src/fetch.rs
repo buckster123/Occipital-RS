@@ -35,7 +35,16 @@ pub struct FetchResponse {
 /// The fetch seam. Mock it to test everything above the network.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
+    /// Fetch a URL, honoring robots.txt (the path for arbitrary page reads).
     async fn get(&self, url: &str) -> anyhow::Result<FetchResponse>;
+
+    /// Fetch without the robots gate — for *deliberate* API calls to a search
+    /// provider (querying a service we mean to use, not crawling its content).
+    /// Still throttled + concurrency-capped. Defaults to [`get`](Self::get) so
+    /// mocks need not override it.
+    async fn get_unchecked(&self, url: &str) -> anyhow::Result<FetchResponse> {
+        self.get(url).await
+    }
 }
 
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
@@ -104,32 +113,19 @@ impl PoliteFetcher {
     }
 }
 
-#[async_trait]
-impl Fetcher for PoliteFetcher {
-    async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
+impl PoliteFetcher {
+    fn parse_http(url: &str) -> anyhow::Result<Url> {
         let parsed = Url::parse(url)?;
         if !matches!(parsed.scheme(), "http" | "https") {
             anyhow::bail!("unsupported scheme: {}", parsed.scheme());
         }
+        Ok(parsed)
+    }
 
-        // 1. robots gate
-        if self.respect_robots {
-            if let Some(host) = parsed.host_str() {
-                let robots = self.robots_for(parsed.scheme(), host).await;
-                let path_q = match parsed.query() {
-                    Some(q) => format!("{}?{}", parsed.path(), q),
-                    None => parsed.path().to_string(),
-                };
-                if !robots.allowed(&path_q) {
-                    anyhow::bail!("blocked by robots.txt: {url}");
-                }
-            }
-        }
-
-        // 2. per-domain throttle (no concurrency permit held while merely waiting)
-        self.limiter.throttle(&Self::rate_key(&parsed)).await;
-
-        // 3. concurrency cap, then 4. send with polite backoff on 429/503
+    /// Throttle → concurrency permit → send with polite backoff on 429/503. The
+    /// robots check is the caller's responsibility (so provider API calls skip it).
+    async fn send(&self, parsed: Url) -> anyhow::Result<FetchResponse> {
+        self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
         let mut attempt = 0u32;
         loop {
@@ -140,7 +136,7 @@ impl Fetcher for PoliteFetcher {
                         let wait = retry_after(&resp)
                             .unwrap_or_else(|| backoff_delay(attempt, BACKOFF_BASE, BACKOFF_CAP));
                         attempt += 1;
-                        tracing::debug!(%url, ?wait, status = status.as_u16(), "backing off");
+                        tracing::debug!(url = %parsed, ?wait, status = status.as_u16(), "backing off");
                         tokio::time::sleep(wait).await;
                         continue;
                     }
@@ -176,6 +172,37 @@ impl Fetcher for PoliteFetcher {
                 }
             }
         }
+    }
+
+    async fn robots_gate(&self, parsed: &Url, url: &str) -> anyhow::Result<()> {
+        if !self.respect_robots {
+            return Ok(());
+        }
+        if let Some(host) = parsed.host_str() {
+            let robots = self.robots_for(parsed.scheme(), host).await;
+            let path_q = match parsed.query() {
+                Some(q) => format!("{}?{}", parsed.path(), q),
+                None => parsed.path().to_string(),
+            };
+            if !robots.allowed(&path_q) {
+                anyhow::bail!("blocked by robots.txt: {url}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Fetcher for PoliteFetcher {
+    async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
+        let parsed = Self::parse_http(url)?;
+        self.robots_gate(&parsed, url).await?;
+        self.send(parsed).await
+    }
+
+    async fn get_unchecked(&self, url: &str) -> anyhow::Result<FetchResponse> {
+        let parsed = Self::parse_http(url)?;
+        self.send(parsed).await
     }
 }
 

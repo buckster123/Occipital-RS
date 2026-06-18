@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use occipital::Config;
+use occipital::{Config, Engine};
 use tracing::info;
 
 mod dispatch;
@@ -13,8 +13,8 @@ use transport::StdioTransport;
 /// occipital-mcp — MCP-over-stdio server exposing the Occipital web tool surface
 /// (`web_search` / `web_fetch` / `web_recall` / `web_save` / `web_forget`).
 ///
-/// Phase 0: the handshake + tool surface are live; the tools themselves return an
-/// honest not-implemented error until their roadmap phases land.
+/// `web_search` + `web_fetch` are live (Phase 3); `web_recall` / `web_save` /
+/// `web_forget` return an honest not-implemented error until the cache phases.
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -22,10 +22,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr) // stdout is reserved for JSON-RPC; logs → stderr
         .init();
 
-    let config = Arc::new(Config::from_env()?);
+    let config = Config::from_env()?;
+    let engine = Arc::new(Engine::from_config(&config)?);
     info!(
         tier = ?config.tier(),
-        provider = %config.search_provider,
+        provider = %engine.provider_name(),
         "occipital-mcp starting"
     );
 
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
                 let method = msg["method"].as_str().unwrap_or("").to_string();
                 let resp = match method.as_str() {
                     "tools/list" => dispatch::tools_list(&msg),
-                    "tools/call" => dispatch::dispatch_tool(msg, Arc::clone(&config)).await,
+                    "tools/call" => dispatch::dispatch_tool(msg, Arc::clone(&engine)).await,
                     _ => dispatch::method_not_found(&msg),
                 };
                 transport.write(&resp).await?;
