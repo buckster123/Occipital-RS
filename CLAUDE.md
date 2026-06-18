@@ -145,7 +145,8 @@ UI can render what the agent is reading. Pure-MCP consumers ignore it.
 | `OCCIPITAL_FRESH_TTL_SECS` | `86400` | default cache freshness window |
 | `OCCIPITAL_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo`/`searxng`/`brave`/`tavily`/`bing` |
 | `OCCIPITAL_SEARXNG_URL` | unset | SearXNG instance base URL |
-| `OCCIPITAL_<PROVIDER>_KEY` | unset | keyed-provider API key (per provider) |
+| `OCCIPITAL_<PROVIDER>_KEY` | unset | keyed-provider API key (per provider); overrides the key file |
+| `OCCIPITAL_KEYS_FILE` | `<data_dir>/occipital/keys.json` | persisted provider-key store (0600); managed via `occipital keys set/list/rm` |
 
 Keys are managed via CLI/API CRUD too (stored 0600), not only env — mirror agentd's token file.
 

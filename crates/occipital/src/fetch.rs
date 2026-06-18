@@ -35,6 +35,41 @@ pub struct FetchResponse {
     pub source:        Source,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+/// A general request — the building block keyed search providers use (custom
+/// headers, POST bodies). `robots` gates only arbitrary page reads, not
+/// deliberate provider API calls.
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method:  Method,
+    pub url:     String,
+    pub headers: Vec<(String, String)>,
+    pub body:    Option<Vec<u8>>,
+    pub robots:  bool,
+}
+
+impl HttpRequest {
+    /// A no-robots GET with headers (Brave/Bing-style keyed APIs).
+    pub fn get_api(url: impl Into<String>, headers: Vec<(String, String)>) -> Self {
+        Self { method: Method::Get, url: url.into(), headers, body: None, robots: false }
+    }
+    /// A no-robots POST with a JSON body (Tavily-style keyed APIs).
+    pub fn post_json(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: Method::Post,
+            url: url.into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: Some(body.into()),
+            robots: false,
+        }
+    }
+}
+
 /// The fetch seam. Mock it to test everything above the network.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
@@ -60,6 +95,17 @@ pub trait Fetcher: Send + Sync {
         _last_modified: Option<&str>,
     ) -> anyhow::Result<FetchResponse> {
         self.get(url).await
+    }
+
+    /// A general request (custom method/headers/body) — keyed search providers.
+    /// Defaults to GET-only via [`get`](Self::get)/[`get_unchecked`](Self::get_unchecked)
+    /// (headers dropped, POST unsupported) so simple mocks need not override it.
+    async fn request(&self, req: HttpRequest) -> anyhow::Result<FetchResponse> {
+        match req.method {
+            Method::Get if req.robots => self.get(&req.url).await,
+            Method::Get => self.get_unchecked(&req.url).await,
+            Method::Post => anyhow::bail!("this fetcher does not support POST"),
+        }
     }
 }
 
@@ -138,27 +184,30 @@ impl PoliteFetcher {
         Ok(parsed)
     }
 
-    /// Throttle → concurrency permit → send with polite backoff on 429/503,
-    /// optionally with conditional-GET validators. The robots check is the
-    /// caller's responsibility (so provider API calls skip it). A `304` is
-    /// returned as-is (empty body) — not retried.
-    async fn send_with(
+    /// Throttle → concurrency permit → send (method/headers/body) with polite
+    /// backoff on 429/503. The robots check is the caller's responsibility (so
+    /// provider API calls skip it). A `304` is returned as-is (empty body) — not
+    /// retried.
+    async fn send_core(
         &self,
         parsed: Url,
-        conditional: Option<(Option<&str>, Option<&str>)>,
+        method: Method,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
     ) -> anyhow::Result<FetchResponse> {
         self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
         let mut attempt = 0u32;
         loop {
-            let mut req = self.client.get(parsed.clone());
-            if let Some((etag, last_modified)) = conditional {
-                if let Some(e) = etag {
-                    req = req.header(reqwest::header::IF_NONE_MATCH, e);
-                }
-                if let Some(lm) = last_modified {
-                    req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
-                }
+            let mut req = match method {
+                Method::Get => self.client.get(parsed.clone()),
+                Method::Post => self.client.post(parsed.clone()),
+            };
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if let Some(b) = &body {
+                req = req.body(b.clone());
             }
             match req.send().await {
                 Ok(resp) => {
@@ -232,12 +281,12 @@ impl Fetcher for PoliteFetcher {
     async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
         let parsed = Self::parse_http(url)?;
         self.robots_gate(&parsed, url).await?;
-        self.send_with(parsed, None).await
+        self.send_core(parsed, Method::Get, Vec::new(), None).await
     }
 
     async fn get_unchecked(&self, url: &str) -> anyhow::Result<FetchResponse> {
         let parsed = Self::parse_http(url)?;
-        self.send_with(parsed, None).await
+        self.send_core(parsed, Method::Get, Vec::new(), None).await
     }
 
     async fn get_conditional(
@@ -248,7 +297,22 @@ impl Fetcher for PoliteFetcher {
     ) -> anyhow::Result<FetchResponse> {
         let parsed = Self::parse_http(url)?;
         self.robots_gate(&parsed, url).await?;
-        self.send_with(parsed, Some((etag, last_modified))).await
+        let mut headers = Vec::new();
+        if let Some(e) = etag {
+            headers.push(("if-none-match".to_string(), e.to_string()));
+        }
+        if let Some(lm) = last_modified {
+            headers.push(("if-modified-since".to_string(), lm.to_string()));
+        }
+        self.send_core(parsed, Method::Get, headers, None).await
+    }
+
+    async fn request(&self, req: HttpRequest) -> anyhow::Result<FetchResponse> {
+        let parsed = Self::parse_http(&req.url)?;
+        if req.robots {
+            self.robots_gate(&parsed, &req.url).await?;
+        }
+        self.send_core(parsed, req.method, req.headers, req.body).await
     }
 }
 

@@ -5,7 +5,7 @@
 //! does nothing is worse than one that says so).
 
 use clap::{Parser, Subcommand};
-use occipital::{Config, Engine};
+use occipital::{Config, Engine, Keys};
 
 #[derive(Parser)]
 #[command(name = "occipital", version, about = "The agent's reading cortex — web search, fetch, recall, cache ops")]
@@ -24,8 +24,23 @@ enum Command {
     Recall { query: String },
     /// Run cache garbage-collection (decay-based pruning).
     Gc,
+    /// Manage search-provider API keys (Brave / Tavily / Bing).
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
     /// Show config + tier + cache stats.
     Status,
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Store a provider's API key (written 0600).
+    Set { provider: String, key: String },
+    /// List providers with a stored key (redacted).
+    List,
+    /// Remove a provider's stored key.
+    Rm { provider: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +60,33 @@ fn main() -> anyhow::Result<()> {
             let engine = Engine::from_config(&config)?;
             let pruned = engine.gc()?;
             println!("garbage-collected {pruned} stale page(s)");
+        }
+        Command::Keys { action } => {
+            let mut keys = Keys::load(&config.keys_file);
+            match action {
+                KeysAction::Set { provider, key } => {
+                    keys.set(&provider, &key);
+                    keys.save()?;
+                    println!("stored key for {provider}");
+                }
+                KeysAction::List => {
+                    let listed = keys.list();
+                    if listed.is_empty() {
+                        println!("(no stored keys)");
+                    }
+                    for (p, redacted) in listed {
+                        println!("{p}: {redacted}");
+                    }
+                }
+                KeysAction::Rm { provider } => {
+                    if keys.remove(&provider) {
+                        keys.save()?;
+                        println!("removed key for {provider}");
+                    } else {
+                        println!("no stored key for {provider}");
+                    }
+                }
+            }
         }
         Command::Search { .. } | Command::Fetch { .. } | Command::Recall { .. } => {
             // The live search/fetch/recall verbs land with the CLI surface (Phase 8);

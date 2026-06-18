@@ -17,6 +17,7 @@ use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Page};
 use crate::fetch::{Fetcher, PoliteFetcher};
+use crate::keys::Keys;
 use crate::providers::{provider_for, SearchProvider, SearchResult};
 
 /// One hit from `web_recall` over already-read pages.
@@ -52,9 +53,10 @@ impl Engine {
                 None
             }
         };
+        let keys = Keys::load(&cfg.keys_file);
         Ok(Self {
             fetcher,
-            provider: provider_for(cfg),
+            provider: provider_for(cfg, &keys),
             cache,
             embedder: make_embedder(&cfg.embed_model),
             top_n: cfg.search_top_n,

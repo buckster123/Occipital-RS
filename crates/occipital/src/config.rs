@@ -48,6 +48,7 @@ pub enum Tier {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub db_path:            PathBuf,
+    pub keys_file:          PathBuf,
     /// Empty string → FTS5-only (Nano); otherwise the bge model id (Micro+).
     pub embed_model:        String,
     /// Honest, identifiable user-agent. Never randomized per-request.
@@ -72,6 +73,7 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             db_path:            db_path(),
+            keys_file:          keys_file(),
             embed_model:        env::var("OCCIPITAL_EMBED_MODEL")
                                     .unwrap_or_else(|_| EMBED_MODEL.to_string()),
             user_agent:         env::var("OCCIPITAL_USER_AGENT")
@@ -112,10 +114,19 @@ fn db_path() -> PathBuf {
     if let Ok(p) = env::var("OCCIPITAL_DB") {
         return PathBuf::from(p);
     }
-    dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("occipital")
-        .join("occipital.db")
+    occipital_dir().join("occipital.db")
+}
+
+/// Provider key store: `OCCIPITAL_KEYS_FILE`, else `<data_dir>/occipital/keys.json`.
+fn keys_file() -> PathBuf {
+    if let Ok(p) = env::var("OCCIPITAL_KEYS_FILE") {
+        return PathBuf::from(p);
+    }
+    occipital_dir().join("keys.json")
+}
+
+fn occipital_dir() -> PathBuf {
+    dirs_next::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("occipital")
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -136,6 +147,7 @@ mod tests {
     fn cfg(embed: &str) -> Config {
         Config {
             db_path:            PathBuf::from("/tmp/x.db"),
+            keys_file:          PathBuf::from("/tmp/keys.json"),
             embed_model:        embed.to_string(),
             user_agent:         default_user_agent(),
             respect_robots:     true,
