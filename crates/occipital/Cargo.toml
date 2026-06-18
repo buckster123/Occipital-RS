@@ -7,9 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace    = true
-tracing.workspace   = true
-dirs-next.workspace = true
+anyhow.workspace      = true
+tracing.workspace     = true
+dirs-next.workspace   = true
+reqwest.workspace     = true
+tokio.workspace       = true
+url.workspace         = true
+rand.workspace        = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

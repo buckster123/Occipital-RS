@@ -19,6 +19,7 @@ pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 30; // Nano-safe per-request timeout
 pub const DEFAULT_MAX_BODY_BYTES: usize = 2_000_000; // per-page body cap
 pub const DEFAULT_SEARCH_TOP_N: usize = 5; // results fetched per search
 pub const DEFAULT_SEARCH_PROVIDER: &str = "duckduckgo";
+pub const DEFAULT_MAX_RETRIES: u32 = 3; // polite backoff retries on 429/503/transient
 
 // Compile-time guard: a conservative posture is the whole point — a careless
 // edit that makes the crawler aggressive must fail the build, not just a test.
@@ -52,6 +53,7 @@ pub struct Config {
     pub search_top_n:       usize,
     pub search_provider:    String,
     pub searxng_url:        Option<String>,
+    pub max_retries:        u32,
 }
 
 impl Config {
@@ -73,6 +75,7 @@ impl Config {
             search_provider:    env::var("OCCIPITAL_SEARCH_PROVIDER")
                                     .unwrap_or_else(|_| DEFAULT_SEARCH_PROVIDER.to_string()),
             searxng_url:        env::var("OCCIPITAL_SEARXNG_URL").ok().filter(|s| !s.is_empty()),
+            max_retries:        env_parse("OCCIPITAL_MAX_RETRIES", DEFAULT_MAX_RETRIES),
         })
     }
 
@@ -130,6 +133,7 @@ mod tests {
             search_top_n:       DEFAULT_SEARCH_TOP_N,
             search_provider:    DEFAULT_SEARCH_PROVIDER.to_string(),
             searxng_url:        None,
+            max_retries:        DEFAULT_MAX_RETRIES,
         }
     }
 
