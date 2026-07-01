@@ -108,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
             println!("db:        {}", config.db_path.display());
             println!("robots:    {}", config.respect_robots);
             println!("rate/dom:  {} req/s", config.rate_per_domain);
+            println!("curation:  {:?}", config.curate.backend);
+            println!(
+                "auto:      {:?} (every {}s, cap {}/24h)",
+                config.curate.auto, config.curate.auto_interval_secs,
+                if config.curate.auto_cap == 0 { "∞".to_string() } else { config.curate.auto_cap.to_string() }
+            );
         }
         Command::Gc => {
             let engine = Engine::from_config(&config)?;

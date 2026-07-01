@@ -352,6 +352,18 @@ impl Cache {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Distillations performed since `cutoff` (by `distilled_at`) — the
+    /// auto-distill budget counter. RFC3339 UTC strings compare lexically.
+    pub fn distilled_since(&self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM distillations WHERE distilled_at > ?1",
+            params![cutoff.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// How many cached pages still need distillation (see `undistilled_urls`).
     pub fn undistilled_count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();

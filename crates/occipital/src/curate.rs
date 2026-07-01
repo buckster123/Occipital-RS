@@ -51,6 +51,34 @@ const MAX_KEY_POINTS: usize = 10;
 const MAX_ENTITIES: usize = 20;
 const MAX_TAGS: usize = 8;
 
+/// Auto-distillation defaults — the "living" knob (see [`AutoDistill`]).
+const DEFAULT_AUTO_INTERVAL_SECS: u64 = 300;
+const DEFAULT_AUTO_CAP: usize = 50;
+
+/// Whether pages distill themselves in the background (the resident servers'
+/// periodic sweep). **Off by default** — auto-curation is opt-in, and `local`
+/// exists so a node can keep auto strictly on the free Ollama path even when
+/// explicit `web_distill` calls may fall back to the paid API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoDistill {
+    /// No background curation (default). `web_distill` stays explicit-only.
+    Off,
+    /// Background curation via Ollama ONLY — never spends API tokens.
+    Local,
+    /// Background curation via the configured backend (API fallback included).
+    On,
+}
+
+impl AutoDistill {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "local" | "ollama" => Self::Local,
+            "on" | "1" | "true" | "yes" | "any" => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
+
 /// Which transport distillation uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurateBackend {
@@ -84,6 +112,13 @@ pub struct CurateConfig {
     pub ollama_model: String,
     pub anthropic_key: Option<String>,
     pub anthropic_model: String,
+    /// Background curation mode (default off — see [`AutoDistill`]).
+    pub auto: AutoDistill,
+    /// Seconds between background sweep ticks (floor 30).
+    pub auto_interval_secs: u64,
+    /// Max distillations per rolling 24 h before auto pauses (0 = uncapped).
+    /// Counts ALL distillations (explicit included) — a total-spend guard.
+    pub auto_cap: usize,
 }
 
 impl Default for CurateConfig {
@@ -94,6 +129,9 @@ impl Default for CurateConfig {
             ollama_model: DEFAULT_OLLAMA_MODEL.to_string(),
             anthropic_key: None,
             anthropic_model: DEFAULT_ANTHROPIC_MODEL.to_string(),
+            auto: AutoDistill::Off,
+            auto_interval_secs: DEFAULT_AUTO_INTERVAL_SECS,
+            auto_cap: DEFAULT_AUTO_CAP,
         }
     }
 }
@@ -115,12 +153,21 @@ impl CurateConfig {
             .ok()
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string());
+        let auto = std::env::var("OCCIPITAL_AUTO_DISTILL")
+            .map(|s| AutoDistill::parse(&s))
+            .unwrap_or(AutoDistill::Off);
+        let env_parse = |key: &str, default: u64| -> u64 {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
         Self {
             backend,
             ollama_url: ollama_url.trim_end_matches('/').to_string(),
             ollama_model,
             anthropic_key,
             anthropic_model,
+            auto,
+            auto_interval_secs: env_parse("OCCIPITAL_AUTO_DISTILL_INTERVAL_SECS", DEFAULT_AUTO_INTERVAL_SECS).max(30),
+            auto_cap: env_parse("OCCIPITAL_AUTO_DISTILL_CAP", DEFAULT_AUTO_CAP as u64) as usize,
         }
     }
 }
@@ -154,6 +201,23 @@ pub fn make_distiller(cfg: &CurateConfig) -> Option<std::sync::Arc<dyn Distiller
     match cfg.backend {
         CurateBackend::Off => None,
         _ => Some(std::sync::Arc::new(LlmDistiller { cfg: cfg.clone() })),
+    }
+}
+
+/// Build the BACKGROUND distiller per the auto mode, or `None` when auto is off
+/// (or curation is off entirely). `Local` pins the transport to Ollama-only so
+/// the background sweep can never fall back to the paid API, whatever the
+/// explicit-call backend is.
+pub fn make_auto_distiller(cfg: &CurateConfig) -> Option<std::sync::Arc<dyn Distiller>> {
+    if cfg.backend == CurateBackend::Off {
+        return None;
+    }
+    match cfg.auto {
+        AutoDistill::Off => None,
+        AutoDistill::On => make_distiller(cfg),
+        AutoDistill::Local => Some(std::sync::Arc::new(LlmDistiller {
+            cfg: CurateConfig { backend: CurateBackend::Ollama, ..cfg.clone() },
+        })),
     }
 }
 
@@ -390,6 +454,41 @@ mod tests {
         let cfg = CurateConfig { backend: CurateBackend::Off, ..Default::default() };
         assert!(make_distiller(&cfg).is_none());
         assert!(make_distiller(&CurateConfig::default()).is_some(), "auto builds one");
+    }
+
+    #[test]
+    fn parses_auto_distill_aliases() {
+        assert_eq!(AutoDistill::parse("local"), AutoDistill::Local);
+        assert_eq!(AutoDistill::parse("OLLAMA"), AutoDistill::Local);
+        assert_eq!(AutoDistill::parse("on"), AutoDistill::On);
+        assert_eq!(AutoDistill::parse("1"), AutoDistill::On);
+        assert_eq!(AutoDistill::parse("off"), AutoDistill::Off);
+        assert_eq!(AutoDistill::parse(""), AutoDistill::Off);
+        assert_eq!(AutoDistill::parse("whatever"), AutoDistill::Off, "unknown = off (safe)");
+    }
+
+    #[test]
+    fn auto_distiller_matrix() {
+        // Default: auto off → no background distiller even with curation on.
+        assert!(make_auto_distiller(&CurateConfig::default()).is_none());
+        // Auto on → background distiller exists.
+        let on = CurateConfig { auto: AutoDistill::On, ..Default::default() };
+        assert!(make_auto_distiller(&on).is_some());
+        // Local: exists even when the explicit backend is Anthropic (pinned to
+        // ollama internally — never the API).
+        let local = CurateConfig {
+            auto: AutoDistill::Local,
+            backend: CurateBackend::Anthropic,
+            ..Default::default()
+        };
+        assert!(make_auto_distiller(&local).is_some());
+        // Curation off entirely → auto is off no matter the mode.
+        let off = CurateConfig {
+            auto: AutoDistill::On,
+            backend: CurateBackend::Off,
+            ..Default::default()
+        };
+        assert!(make_auto_distiller(&off).is_none());
     }
 
     #[test]
