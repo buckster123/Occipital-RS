@@ -8,6 +8,8 @@
 use std::env;
 use std::path::PathBuf;
 
+use crate::curate::CurateConfig;
+
 /// Default embedding model (Micro+ tier). Empty string → FTS5-only (Nano).
 pub const EMBED_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -66,6 +68,8 @@ pub struct Config {
     pub decay_half_life_secs: u64,
     pub gc_min_salience:    f32,
     pub gc_min_age_secs:    u64,
+    /// LLM curation (the distillation layer) — see `curate`.
+    pub curate:             CurateConfig,
 }
 
 impl Config {
@@ -92,6 +96,7 @@ impl Config {
             decay_half_life_secs: env_parse("OCCIPITAL_DECAY_HALFLIFE_SECS", DEFAULT_DECAY_HALFLIFE_SECS),
             gc_min_salience:    env_parse("OCCIPITAL_GC_MIN_SALIENCE", DEFAULT_GC_MIN_SALIENCE),
             gc_min_age_secs:    env_parse("OCCIPITAL_GC_MIN_AGE_SECS", DEFAULT_GC_MIN_AGE_SECS),
+            curate:             CurateConfig::from_env(),
         })
     }
 
@@ -163,6 +168,7 @@ mod tests {
             decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
             gc_min_salience:    DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs:    DEFAULT_GC_MIN_AGE_SECS,
+            curate:             CurateConfig::default(),
         }
     }
 

@@ -22,6 +22,14 @@ enum Command {
     Fetch { url: String },
     /// Recall from already-read (cached) pages only.
     Recall { query: String },
+    /// Distill cached pages into curated knowledge (summary/points/entities/tags).
+    Distill {
+        /// Distill this page (fetched first if not cached); omit to sweep.
+        url: Option<String>,
+        /// Sweep size when no URL is given (default 3, max 10).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Run cache garbage-collection (decay-based pruning).
     Gc,
     /// Manage search-provider API keys (Brave / Tavily / Bing).
@@ -74,8 +82,24 @@ async fn main() -> anyhow::Result<()> {
             }
             for h in &hits {
                 let score = h.score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "—".into());
-                println!("{score}  {}\n   {}\n", h.url, h.snippet);
+                let tags = if h.tags.is_empty() { String::new() } else { format!("  [{}]", h.tags.join(", ")) };
+                println!("{score}  {}{tags}\n   {}\n", h.url, h.snippet);
             }
+        }
+        Command::Distill { url, limit } => {
+            let engine = Engine::from_config(&config)?;
+            let report = engine.distill(url.as_deref(), limit).await?;
+            for d in &report.distilled {
+                let cached = if d.from_cache { " [already distilled]" } else { "" };
+                println!("✓ {}{cached}\n   {}\n   tags: {}\n", d.url, d.summary, d.tags.join(", "));
+            }
+            for f in &report.failed {
+                println!("✗ {}\n   {}\n", f.url, f.error);
+            }
+            println!(
+                "distilled {} page(s), {} failed, {} still pending",
+                report.distilled.len(), report.failed.len(), report.remaining
+            );
         }
         Command::Status => {
             println!("occipital {}", occipital::version());

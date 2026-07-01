@@ -13,6 +13,7 @@ use crate::cache::Cache;
 use crate::config::{
     Config, DEFAULT_DECAY_HALFLIFE_SECS, DEFAULT_GC_MIN_AGE_SECS, DEFAULT_GC_MIN_SALIENCE,
 };
+use crate::curate::{make_distiller, Distiller};
 use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Page};
@@ -25,16 +26,57 @@ use crate::providers::{provider_for, SearchProvider, SearchResult};
 pub struct RecallHit {
     pub url:     String,
     pub title:   Option<String>,
+    /// The distilled summary when the page is curated, else a raw-body preview.
     pub snippet: String,
     /// Cosine score (semantic recall) or `None` (FTS5 keyword recall).
     pub score:   Option<f32>,
+    /// Distilled topic tags (empty when the page isn't curated yet).
+    pub tags:    Vec<String>,
+    /// Whether `snippet` is curated knowledge rather than a raw preview.
+    pub distilled: bool,
 }
+
+/// One page successfully distilled by [`Engine::distill`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DistilledPage {
+    pub url:        String,
+    pub title:      Option<String>,
+    pub summary:    String,
+    pub key_points: Vec<String>,
+    pub entities:   Vec<String>,
+    pub tags:       Vec<String>,
+    pub model:      String,
+    pub backend:    String,
+    /// `true` when a current distillation already existed (no LLM call made).
+    pub from_cache: bool,
+}
+
+/// One page that failed to distill (the sweep continues past failures).
+#[derive(Debug, Clone, Serialize)]
+pub struct DistillFailure {
+    pub url:   String,
+    pub error: String,
+}
+
+/// The outcome of a distill run (single URL or sweep).
+#[derive(Debug, Clone, Serialize)]
+pub struct DistillReport {
+    pub distilled: Vec<DistilledPage>,
+    pub failed:    Vec<DistillFailure>,
+    /// Cached pages still awaiting distillation after this run.
+    pub remaining: usize,
+}
+
+/// Default pages per no-URL distill sweep — bounded so one call stays cheap
+/// (each page is an LLM call); `limit` overrides within [1, 10].
+const DEFAULT_DISTILL_SWEEP: usize = 3;
 
 pub struct Engine {
     fetcher:            Arc<dyn Fetcher>,
     provider:           Box<dyn SearchProvider>,
     cache:              Option<Arc<Cache>>,
     embedder:           Option<Arc<dyn Embedder>>,
+    distiller:          Option<Arc<dyn Distiller>>,
     top_n:              usize,
     fresh_ttl_secs:     u64,
     decay_half_life_secs: u64,
@@ -59,6 +101,7 @@ impl Engine {
             provider: provider_for(cfg, &keys),
             cache,
             embedder: make_embedder(&cfg.embed_model),
+            distiller: make_distiller(&cfg.curate),
             top_n: cfg.search_top_n,
             fresh_ttl_secs: cfg.fresh_ttl_secs,
             decay_half_life_secs: cfg.decay_half_life_secs,
@@ -83,6 +126,7 @@ impl Engine {
             provider,
             cache,
             embedder: None,
+            distiller: None,
             top_n,
             fresh_ttl_secs,
             decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
@@ -93,6 +137,11 @@ impl Engine {
 
     pub fn with_embedder(mut self, embedder: Option<Arc<dyn Embedder>>) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    pub fn with_distiller(mut self, distiller: Option<Arc<dyn Distiller>>) -> Self {
+        self.distiller = distiller;
         self
     }
 
@@ -259,15 +308,108 @@ impl Engine {
         let mut hits = Vec::new();
         for (url, score, _) in ranked {
             if let Some(row) = cache.get_page(&url)? {
+                // A curated page recalls as knowledge: the distilled summary +
+                // tags, not a raw-body preview.
+                let (snip, tags, distilled) = match cache.get_distillation(&url)? {
+                    Some(d) => (d.summary, d.tags, true),
+                    None => (snippet(&row.page.markdown), Vec::new(), false),
+                };
                 hits.push(RecallHit {
                     url,
                     title: row.page.title,
-                    snippet: snippet(&row.page.markdown),
+                    snippet: snip,
                     score,
+                    tags,
+                    distilled,
                 });
             }
         }
         Ok(hits)
+    }
+
+    /// Distill cached pages into curated knowledge (summary, key points,
+    /// entities, tags) via the configured LLM backend.
+    ///
+    /// With `url`: distill that page, fetching it first if uncached; a current
+    /// distillation (matching page hash) is returned without an LLM call.
+    /// Without: sweep up to `limit` (default 3, clamped 1–10) pages that were
+    /// never distilled or whose content changed since. One page failing does
+    /// not stop the sweep.
+    pub async fn distill(
+        &self,
+        url: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<DistillReport> {
+        let Some(distiller) = &self.distiller else {
+            anyhow::bail!("curation disabled (OCCIPITAL_CURATE_BACKEND=off)");
+        };
+        let Some(cache) = &self.cache else {
+            anyhow::bail!("no cache — nothing to distill");
+        };
+
+        let mut distilled = Vec::new();
+        let mut failed = Vec::new();
+
+        let targets: Vec<String> = match url {
+            Some(u) => {
+                let u = u.trim();
+                if u.is_empty() {
+                    anyhow::bail!("empty url");
+                }
+                // Read-through: an uncached URL is fetched (and stored) first.
+                let (page, _) = self.fetch(u, false).await?;
+                // A current distillation is served as-is — an explicit re-ask
+                // on unchanged content shouldn't re-spend an LLM call.
+                if let Some(d) = cache.get_distillation(&page.url)? {
+                    if d.content_hash == page.content_hash {
+                        distilled.push(DistilledPage {
+                            url:        page.url,
+                            title:      page.title,
+                            summary:    d.summary,
+                            key_points: d.key_points,
+                            entities:   d.entities,
+                            tags:       d.tags,
+                            model:      d.model.unwrap_or_default(),
+                            backend:    "cache".into(),
+                            from_cache: true,
+                        });
+                        let remaining = cache.undistilled_count()?;
+                        return Ok(DistillReport { distilled, failed, remaining });
+                    }
+                }
+                vec![page.url]
+            }
+            None => cache.undistilled_urls(limit.unwrap_or(DEFAULT_DISTILL_SWEEP).clamp(1, 10))?,
+        };
+
+        for target in targets {
+            let Some(row) = cache.get_page(&target)? else { continue };
+            match distiller.distill_page(&row.page).await {
+                Ok(d) => {
+                    cache.put_distillation(&target, &d, &row.page.content_hash)?;
+                    distilled.push(DistilledPage {
+                        url:        target,
+                        title:      row.page.title,
+                        summary:    d.summary,
+                        key_points: d.key_points,
+                        entities:   d.entities,
+                        tags:       d.tags,
+                        model:      d.model,
+                        backend:    d.backend.to_string(),
+                        from_cache: false,
+                    });
+                }
+                Err(e) => failed.push(DistillFailure { url: target, error: e.to_string() }),
+            }
+        }
+
+        let remaining = cache.undistilled_count()?;
+        Ok(DistillReport { distilled, failed, remaining })
+    }
+
+    /// Whether LLM curation is active (a distiller is configured).
+    pub fn curation(&self) -> bool {
+        self.distiller.is_some()
     }
 
     /// Garbage-collect stale memory: prune unpinned pages whose **effective
@@ -506,6 +648,115 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://e.test/rust");
         assert!(hits[0].score.is_none(), "keyword recall has no cosine score");
+    }
+
+    // ---- distillation (knowledge hub) -------------------------------------
+
+    use crate::curate::{Distillation, Distiller};
+
+    /// A canned distiller that counts LLM calls and can fail on demand.
+    struct MockDistiller {
+        calls: AtomicUsize,
+        fail:  bool,
+    }
+    impl MockDistiller {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { calls: AtomicUsize::new(0), fail: false })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self { calls: AtomicUsize::new(0), fail: true })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait]
+    impl Distiller for MockDistiller {
+        async fn distill_page(&self, page: &Page) -> anyhow::Result<Distillation> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("model unreachable");
+            }
+            Ok(Distillation {
+                summary:    format!("Distilled: {}", page.title.as_deref().unwrap_or("?")),
+                key_points: vec!["a key point".into()],
+                entities:   vec!["Entity".into()],
+                tags:       vec!["tag1".into(), "tag2".into()],
+                model:      "mock".into(),
+                backend:    "ollama",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn distill_url_fetches_stores_and_upgrades_recall() {
+        let f = Counting::new(HTML);
+        let mock = MockDistiller::new();
+        let e = engine(f, 3600).with_distiller(Some(mock.clone()));
+
+        let report = e.distill(Some("https://e.test/"), None).await.unwrap();
+        assert_eq!(report.distilled.len(), 1);
+        assert_eq!(report.failed.len(), 0);
+        assert_eq!(report.remaining, 0);
+        assert!(!report.distilled[0].from_cache);
+        assert_eq!(report.distilled[0].summary, "Distilled: T");
+        assert_eq!(mock.calls(), 1, "uncached URL was fetched then distilled");
+
+        // Recall now serves the curated summary + tags, keyword-findable via
+        // distilled terms only ("tag1" is nowhere in the page body).
+        let hits = e.recall("tag1", Some(5)).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].distilled);
+        assert_eq!(hits[0].snippet, "Distilled: T");
+        assert_eq!(hits[0].tags, vec!["tag1", "tag2"]);
+    }
+
+    #[tokio::test]
+    async fn redistilling_unchanged_page_spends_no_llm_call() {
+        let f = Counting::new(HTML);
+        let mock = MockDistiller::new();
+        let e = engine(f, 3600).with_distiller(Some(mock.clone()));
+        e.distill(Some("https://e.test/"), None).await.unwrap();
+        let report = e.distill(Some("https://e.test/"), None).await.unwrap();
+        assert_eq!(mock.calls(), 1, "second ask on unchanged content is free");
+        assert!(report.distilled[0].from_cache);
+        assert_eq!(report.distilled[0].backend, "cache");
+    }
+
+    #[tokio::test]
+    async fn sweep_distills_only_pending_pages_and_reports_failures() {
+        let f = Counting::new(HTML);
+        let mock = MockDistiller::new();
+        let e = engine(f, 3600).with_distiller(Some(mock.clone()));
+        e.fetch("https://e.test/a", false).await.unwrap();
+        e.fetch("https://e.test/b", false).await.unwrap();
+
+        let report = e.distill(None, None).await.unwrap();
+        assert_eq!(report.distilled.len(), 2);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(mock.calls(), 2);
+
+        // Nothing pending → an empty sweep, zero LLM calls.
+        let report = e.distill(None, None).await.unwrap();
+        assert!(report.distilled.is_empty());
+        assert_eq!(mock.calls(), 2);
+
+        // A failing backend reports per-page failures, remaining still pending.
+        let f2 = Counting::new(HTML);
+        let e2 = engine(f2, 3600).with_distiller(Some(MockDistiller::failing()));
+        e2.fetch("https://e.test/c", false).await.unwrap();
+        let report = e2.distill(None, None).await.unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].error.contains("model unreachable"));
+        assert_eq!(report.remaining, 1, "failed page stays pending");
+    }
+
+    #[tokio::test]
+    async fn distill_without_a_distiller_errors_honestly() {
+        let e = engine(Counting::new(HTML), 3600);
+        let err = e.distill(None, None).await.unwrap_err().to_string();
+        assert!(err.contains("curation disabled"), "got: {err}");
+        assert!(!e.curation());
     }
 
     // ---- decay & GC (Phase 6) -------------------------------------------

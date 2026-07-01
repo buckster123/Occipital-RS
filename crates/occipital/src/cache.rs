@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::curate::Distillation;
 use crate::extract::{Link, Page};
 use crate::providers::SearchResult;
 
@@ -25,6 +26,7 @@ pub struct CacheStats {
     pub pinned:     i64,
     pub embeddings: i64,
     pub searches:   i64,
+    pub distilled:  i64,
 }
 
 /// A cached page plus the metadata the read-through needs (validators for a
@@ -36,6 +38,19 @@ pub struct PageRow {
     pub last_modified: Option<String>,
     pub fetched_at:    DateTime<Utc>,
     pub pinned:        bool,
+}
+
+/// A stored distillation (curated knowledge) plus the page hash it distilled —
+/// a hash mismatch against the current page marks it stale (re-distill).
+#[derive(Debug, Clone, Serialize)]
+pub struct DistillRow {
+    pub summary:      String,
+    pub key_points:   Vec<String>,
+    pub entities:     Vec<String>,
+    pub tags:         Vec<String>,
+    pub content_hash: String,
+    pub model:        Option<String>,
+    pub distilled_at: String,
 }
 
 /// Lightweight per-page metadata for decay ranking + GC (no body).
@@ -79,6 +94,17 @@ CREATE TABLE IF NOT EXISTS embeddings (
     vec BLOB NOT NULL                       -- little-endian f32s (Micro+ only)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, markdown);
+CREATE TABLE IF NOT EXISTS distillations (
+    url          TEXT PRIMARY KEY,          -- FK to pages (cascade in delete_page)
+    summary      TEXT NOT NULL,
+    key_points   TEXT NOT NULL,             -- JSON array of strings
+    entities     TEXT NOT NULL,             -- JSON array of strings
+    tags         TEXT NOT NULL,             -- JSON array of strings
+    content_hash TEXT NOT NULL,             -- page hash distilled (stale detection)
+    model        TEXT,                      -- provenance
+    distilled_at TEXT NOT NULL              -- RFC3339
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS distill_fts USING fts5(url UNINDEXED, summary, terms);
 "#;
 
 impl Cache {
@@ -200,7 +226,10 @@ impl Cache {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// FTS5 keyword search over cached pages → matching urls, best-ranked first.
+    /// FTS5 keyword search over cached pages **and their distillations** →
+    /// matching urls, best-ranked first. Raw-body hits lead; pages found only
+    /// via distilled terms (summary/tags/entities) are appended — so curation
+    /// widens keyword recall (the Nano win: no embeddings needed).
     pub fn keyword_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
         let m = fts_query(query);
         if m.is_empty() {
@@ -211,7 +240,128 @@ impl Cache {
             "SELECT url FROM pages_fts WHERE pages_fts MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![m, limit as i64], |r| r.get::<_, String>(0))?;
+        let mut urls: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT url FROM distill_fts WHERE distill_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let distilled = stmt.query_map(params![m, limit as i64], |r| r.get::<_, String>(0))?;
+        for url in distilled {
+            let url = url?;
+            if urls.len() >= limit {
+                break;
+            }
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        urls.truncate(limit);
+        Ok(urls)
+    }
+
+    // ---- distillations (LLM curation) --------------------------------------
+
+    /// Store (or replace) a page's distillation, recording the page hash it was
+    /// distilled from, and index its summary + tags/entities/key-points for
+    /// keyword recall.
+    pub fn put_distillation(
+        &self,
+        url: &str,
+        d: &Distillation,
+        content_hash: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO distillations \
+               (url, summary, key_points, entities, tags, content_hash, model, distilled_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                url,
+                d.summary,
+                serde_json::to_string(&d.key_points)?,
+                serde_json::to_string(&d.entities)?,
+                serde_json::to_string(&d.tags)?,
+                content_hash,
+                d.model,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        // terms: everything findable that isn't the summary prose.
+        let terms = d
+            .tags
+            .iter()
+            .chain(d.entities.iter())
+            .chain(d.key_points.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        conn.execute("DELETE FROM distill_fts WHERE url=?1", params![url])?;
+        conn.execute(
+            "INSERT INTO distill_fts (url, summary, terms) VALUES (?1,?2,?3)",
+            params![url, d.summary, terms],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_distillation(&self, url: &str) -> anyhow::Result<Option<DistillRow>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT summary, key_points, entities, tags, content_hash, model, distilled_at \
+                 FROM distillations WHERE url=?1",
+                params![url],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((summary, key_points, entities, tags, content_hash, model, distilled_at)) = row
+        else {
+            return Ok(None);
+        };
+        let list = |s: &str| serde_json::from_str::<Vec<String>>(s).unwrap_or_default();
+        Ok(Some(DistillRow {
+            summary,
+            key_points: list(&key_points),
+            entities: list(&entities),
+            tags: list(&tags),
+            content_hash,
+            model,
+            distilled_at,
+        }))
+    }
+
+    /// Pages needing distillation: never distilled, or the page content changed
+    /// since (hash mismatch). Newest fetches first — curate fresh reading first.
+    pub fn undistilled_urls(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.url FROM pages p LEFT JOIN distillations d ON p.url = d.url \
+             WHERE d.url IS NULL OR d.content_hash != p.content_hash \
+             ORDER BY p.fetched_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// How many cached pages still need distillation (see `undistilled_urls`).
+    pub fn undistilled_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pages p LEFT JOIN distillations d ON p.url = d.url \
+             WHERE d.url IS NULL OR d.content_hash != p.content_hash",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Record a cache hit: bump `last_access` + `access_count`, and reinforce
@@ -272,6 +422,8 @@ impl Cache {
         let removed = conn.execute("DELETE FROM pages WHERE url=?1", params![url])? > 0;
         conn.execute("DELETE FROM pages_fts WHERE url=?1", params![url])?;
         conn.execute("DELETE FROM embeddings WHERE url=?1", params![url])?;
+        conn.execute("DELETE FROM distillations WHERE url=?1", params![url])?;
+        conn.execute("DELETE FROM distill_fts WHERE url=?1", params![url])?;
         Ok(removed)
     }
 
@@ -305,6 +457,7 @@ impl Cache {
             pinned:     count("SELECT COUNT(*) FROM pages WHERE pinned=1"),
             embeddings: count("SELECT COUNT(*) FROM embeddings"),
             searches:   count("SELECT COUNT(*) FROM searches"),
+            distilled:  count("SELECT COUNT(*) FROM distillations"),
         }
     }
 
@@ -432,6 +585,65 @@ mod tests {
         c.delete_page("https://e.test/x").unwrap();
         assert!(c.all_embeddings().unwrap().is_empty(), "delete clears the embedding");
         assert!(c.keyword_search("body", 5).unwrap().is_empty(), "delete clears the FTS row");
+    }
+
+    // ---- distillations -----------------------------------------------------
+
+    fn distillation(summary: &str, tags: &[&str]) -> Distillation {
+        Distillation {
+            summary:    summary.into(),
+            key_points: vec!["point one".into()],
+            entities:   vec!["ACME Corp".into()],
+            tags:       tags.iter().map(|s| s.to_string()).collect(),
+            model:      "test-model".into(),
+            backend:    "ollama",
+        }
+    }
+
+    #[test]
+    fn distillation_roundtrips_and_delete_cascades() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/x", "body"), None, None, false).unwrap();
+        c.put_distillation("https://e.test/x", &distillation("A summary.", &["rust"]), "abc").unwrap();
+        let row = c.get_distillation("https://e.test/x").unwrap().unwrap();
+        assert_eq!(row.summary, "A summary.");
+        assert_eq!(row.tags, vec!["rust"]);
+        assert_eq!(row.content_hash, "abc");
+        assert_eq!(row.model.as_deref(), Some("test-model"));
+        assert_eq!(c.stats().distilled, 1);
+        c.delete_page("https://e.test/x").unwrap();
+        assert!(c.get_distillation("https://e.test/x").unwrap().is_none(), "cascade");
+        assert_eq!(c.stats().distilled, 0);
+    }
+
+    #[test]
+    fn undistilled_tracks_missing_and_stale_hash() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/a", "body a"), None, None, false).unwrap();
+        c.put_page(&page("https://e.test/b", "body b"), None, None, false).unwrap();
+        assert_eq!(c.undistilled_count().unwrap(), 2, "nothing distilled yet");
+
+        // page() uses content_hash "abc" — distill b against the matching hash.
+        c.put_distillation("https://e.test/b", &distillation("S.", &[]), "abc").unwrap();
+        assert_eq!(c.undistilled_urls(10).unwrap(), vec!["https://e.test/a"]);
+
+        // The page content changes (new hash) → b needs re-distillation.
+        let mut changed = page("https://e.test/b", "new body");
+        changed.content_hash = "def".into();
+        c.put_page(&changed, None, None, false).unwrap();
+        assert_eq!(c.undistilled_count().unwrap(), 2, "hash mismatch marks it stale");
+    }
+
+    #[test]
+    fn keyword_search_finds_pages_via_distilled_terms() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/p", "an article about memory systems"), None, None, false).unwrap();
+        // "cerebro" appears nowhere in the body — only in the distillation tags.
+        assert!(c.keyword_search("cerebro", 5).unwrap().is_empty());
+        c.put_distillation("https://e.test/p", &distillation("About Cerebro.", &["cerebro"]), "abc").unwrap();
+        assert_eq!(c.keyword_search("cerebro", 5).unwrap(), vec!["https://e.test/p"]);
+        // A body hit is not duplicated by its distillation hit.
+        assert_eq!(c.keyword_search("memory systems cerebro", 5).unwrap().len(), 1);
     }
 
     #[test]

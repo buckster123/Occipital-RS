@@ -92,7 +92,7 @@ mod fast {
 
     impl Embedder for FastEmbedder {
         fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-            let mut m = self.model.lock().unwrap();
+            let m = self.model.lock().unwrap();
             let mut out = m.embed(vec![text.to_string()], None)?;
             out.pop().ok_or_else(|| anyhow::anyhow!("empty embedding"))
         }

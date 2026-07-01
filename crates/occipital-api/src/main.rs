@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/search", get(search))
         .route("/fetch", get(fetch))
         .route("/recall", get(recall))
+        .route("/distill", post(distill))
         .route("/save", post(save))
         .route("/forget", delete(forget))
         .route("/gc", post(gc))
@@ -79,6 +80,7 @@ async fn stats(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "provider":  s.engine.provider_name(),
         "semantic":  s.engine.semantic(),
+        "curation":  s.engine.curation(),
         "cache":     s.engine.stats(),
     }))
 }
@@ -123,6 +125,23 @@ struct RecallQ {
 async fn recall(State(s): State<AppState>, Query(q): Query<RecallQ>) -> ApiResult {
     let hits = s.engine.recall(&q.q, q.limit).await?;
     Ok(Json(json!({ "kind": "recall", "query": q.q, "count": hits.len(), "hits": hits })))
+}
+
+#[derive(Deserialize, Default)]
+struct DistillBody {
+    url:   Option<String>,
+    limit: Option<usize>,
+}
+
+/// `POST /distill` — body optional: `{url}` distills one page, `{limit}` bounds
+/// a sweep of not-yet-distilled pages, `{}` sweeps the default batch.
+async fn distill(State(s): State<AppState>, body: Option<Json<DistillBody>>) -> ApiResult {
+    let Json(b) = body.unwrap_or_default();
+    let report = s.engine.distill(b.url.as_deref(), b.limit).await?;
+    Ok(Json(json!({
+        "kind": "distill", "count": report.distilled.len(),
+        "distilled": report.distilled, "failed": report.failed, "remaining": report.remaining,
+    })))
 }
 
 #[derive(Deserialize)]

@@ -21,7 +21,8 @@ The core lib `occipital` is a pipeline with a cache wrapped around it. The three
 | `fetch` | the polite HTTP layer — one `reqwest` client behind a per-domain rate limiter, jitter, backoff, robots cache, honest UA. The only thing that touches the network. Behind a `Fetcher` trait so everything above it is testable with a mock. |
 | `extract` | HTML → `Page { title, byline, markdown, links, content_hash }`. Readability-style boilerplate strip; never returns raw HTML. |
 | `providers` | the `SearchProvider` trait + impls: `duckduckgo` (HTML scrape), `searxng` (JSON), `brave`/`tavily`/`bing` (keyed). Normalizes to `Vec<SearchResult>`. |
-| `cache` | the read-through store: SQLite (`pages`, `searches`), FTS5, optional embeddings. First-hit lookup, conditional-GET refresh, write-back. |
+| `cache` | the read-through store: SQLite (`pages`, `searches`, `distillations`), FTS5, optional embeddings. First-hit lookup, conditional-GET refresh, write-back. |
+| `curate` | the distillation layer (the knowledge hub): a tiered LLM `Distiller` (Ollama local/LAN → Anthropic API, mirroring Cerebro's `describe_image`) turns a cached page into summary/key-points/entities/tags. Explicit-only (`web_distill`/CLI/API); recall serves the distillation over the raw body, and distilled terms are FTS-indexed so curation widens even Nano keyword recall. Talks to an inference endpoint, not the open web — plain reqwest, not the polite `Fetcher`. |
 | `decay` | salience update + GC. Web pages lose salience by age + disuse; the GC prunes stale, unread, low-salience pages. The Cerebro-dream-pruning analog. |
 | `rank` | result ordering: `relevance × freshness × salience`. Keeps stale cached pages from outranking fresh signal in semantic/keyword search. |
 | `config` | env + file config; provider keys (0600); tier detection (Nano/Micro+). |
@@ -50,6 +51,14 @@ embeddings (url, vec BLOB)            -- bge-small, Micro+ only
 searches (                            -- optional: remember query→results for warm cache
   query_hash TEXT PRIMARY KEY, query TEXT, results TEXT, ts TEXT
 )
+distillations (                       -- LLM curation (the knowledge hub layer)
+  url TEXT PRIMARY KEY,               -- cascade-deleted with the page
+  summary TEXT, key_points TEXT,      -- key_points/entities/tags: JSON arrays
+  entities TEXT, tags TEXT,
+  content_hash TEXT,                  -- page hash distilled; mismatch = stale (re-distill)
+  model TEXT, distilled_at TEXT
+)
+distill_fts (url, summary, terms)     -- FTS5 over curated text; unioned into keyword recall
 ```
 
 ## Freshness & the read-through contract
