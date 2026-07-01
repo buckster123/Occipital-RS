@@ -32,6 +32,30 @@ async fn main() -> anyhow::Result<()> {
     let keys_file = config.keys_file.clone();
     let addr = std::env::var("OCCIPITAL_API_ADDR").unwrap_or_else(|_| "127.0.0.1:8799".to_string());
     let engine = Arc::new(Engine::from_config(&config)?);
+
+    // Background auto-curation (OCCIPITAL_AUTO_DISTILL=local|on) — same sweep
+    // as occipital-mcp, for API-only deployments.
+    if engine.auto_curation() {
+        let e = Arc::clone(&engine);
+        let interval = config.curate.auto_interval_secs;
+        tracing::info!(interval, "auto-distill sweep enabled");
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match e.auto_distill_tick().await {
+                    Ok(Some(r)) => tracing::info!(
+                        distilled = r.distilled.len(),
+                        failed = r.failed.len(),
+                        remaining = r.remaining,
+                        "auto-distill sweep"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!("auto-distill sweep failed: {err}"),
+                }
+            }
+        });
+    }
+
     let state = AppState { engine, keys_file };
 
     let app = Router::new()
@@ -81,6 +105,7 @@ async fn stats(State(s): State<AppState>) -> Json<serde_json::Value> {
         "provider":  s.engine.provider_name(),
         "semantic":  s.engine.semantic(),
         "curation":  s.engine.curation(),
+        "auto_curation": s.engine.auto_curation(),
         "cache":     s.engine.stats(),
     }))
 }

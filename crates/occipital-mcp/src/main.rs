@@ -30,6 +30,30 @@ async fn main() -> Result<()> {
         "occipital-mcp starting"
     );
 
+    // Background auto-curation (OCCIPITAL_AUTO_DISTILL=local|on): periodically
+    // sweep pending pages through the distiller so the knowledge base grows as
+    // the agent reads. Bounded per tick + budget-capped inside the engine.
+    if engine.auto_curation() {
+        let e = Arc::clone(&engine);
+        let interval = config.curate.auto_interval_secs;
+        info!(interval, "auto-distill sweep enabled");
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match e.auto_distill_tick().await {
+                    Ok(Some(r)) => info!(
+                        distilled = r.distilled.len(),
+                        failed = r.failed.len(),
+                        remaining = r.remaining,
+                        "auto-distill sweep"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!("auto-distill sweep failed: {err}"),
+                }
+            }
+        });
+    }
+
     let mut transport = StdioTransport::new();
 
     // MCP initialize handshake — guard on the method so a non-initialize first
