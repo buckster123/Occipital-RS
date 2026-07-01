@@ -11,6 +11,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "web_recall",
     "web_save",
     "web_forget",
+    "web_distill",
 ];
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -66,6 +67,18 @@ fn tool_schema(name: &str) -> Value {
                     "url": { "type": "string", "description": "The URL to pin in the cache" }
                 },
                 "required": ["url"]
+            }
+        }),
+        "web_distill" => json!({
+            "name": "web_distill",
+            "description": "Distill already-read pages into curated knowledge — a summary, key points, entities, and topic tags — via the configured LLM backend (local Ollama or API). With url: distill that page (fetching it first if uncached; free if already distilled and unchanged). Without url: sweep a few not-yet-distilled cached pages. Distilled pages sharpen web_recall: recall then returns the summary and tags instead of a raw-body snippet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url":   { "type": "string", "description": "Distill this page (fetched first if not cached)" },
+                    "limit": { "type": "integer", "description": "Sweep size when no url is given (default: 3, max: 10)" }
+                },
+                "required": []
             }
         }),
         "web_forget" => json!({

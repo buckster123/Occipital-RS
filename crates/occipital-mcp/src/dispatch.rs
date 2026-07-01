@@ -155,6 +155,18 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "hits":  hits,
             }))
         }
+        "web_distill" => {
+            let url = args["url"].as_str().filter(|s| !s.trim().is_empty());
+            let limit = args["limit"].as_u64().map(|n| n as usize);
+            let report = engine.distill(url, limit).await?;
+            Ok(json!({
+                "kind":      "distill",
+                "count":     report.distilled.len(),
+                "distilled": report.distilled,
+                "failed":    report.failed,
+                "remaining": report.remaining,
+            }))
+        }
         _ => anyhow::bail!("tool not found: {name}"),
     }
 }
@@ -253,6 +265,16 @@ mod tests {
         let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(out["kind"], "recall");
         assert_eq!(out["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn web_distill_without_a_backend_errors_honestly() {
+        // The test engine has no distiller (curation off) → an honest error,
+        // exercising the route + arg plumbing.
+        let msg = json!({"jsonrpc":"2.0","id":8,"method":"tools/call",
+            "params":{"name":"web_distill","arguments":{}}});
+        let resp = dispatch_tool(msg, engine_with("")).await;
+        assert!(resp["error"]["message"].as_str().unwrap().contains("curation disabled"));
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ sqlite-vec  = "0.1"
 # Embeddings (ONNX, no GPU) — gated by OCCIPITAL_EMBED_MODEL (Nano = off)
 fastembed   = "4"
 # HTTP — rustls (no OpenSSL link dep, Pi/cross-compile friendly), gzip
-reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
 # URL canonicalization
 url         = "2"
 # HTML parsing (reader-mode extraction)

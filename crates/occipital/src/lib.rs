@@ -4,12 +4,13 @@
 //! search providers, and a Cerebro-style decaying knowledge cache. Three thin
 //! binaries (`occipital-mcp` / `-api` / `-cli`) drive this one library.
 //!
-//! Build status: **Phase 7 — keyed providers**. All core modules live, plus
-//! [`keys`] + Brave/Tavily/Bing providers. Remaining: the API/CLI surfaces
-//! (Phase 8) and the ApexOS follow-along UI (Phase 9). See `docs/build-roadmap.md`.
+//! Build status: **Phase 10 — the knowledge hub (LLM curation)**. Phases 0–9
+//! complete (standalone + the ApexOS follow-along UI); [`curate`] adds the
+//! distillation layer — see `docs/build-roadmap.md`.
 
 pub mod cache;
 pub mod config;
+pub mod curate;
 pub mod decay;
 pub mod embed;
 pub mod engine;
@@ -22,6 +23,7 @@ pub mod robots;
 
 pub use cache::{Cache, CacheStats};
 pub use config::{Config, Tier};
+pub use curate::{make_distiller, CurateBackend, CurateConfig, Distillation, Distiller};
 pub use embed::{cosine, make_embedder, Embedder};
 pub use engine::{Engine, RecallHit};
 pub use keys::Keys;

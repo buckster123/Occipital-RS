@@ -123,9 +123,10 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 |------|---------|
 | `web_search` | query → ranked results (cache-first, then live providers) |
 | `web_fetch` | url → reader-mode markdown + links (cache-first, conditional refresh) |
-| `web_recall` | semantic/keyword query over **already-read** pages only (no live hit) |
+| `web_recall` | semantic/keyword query over **already-read** pages only (no live hit); a distilled page recalls as its summary + tags, not a raw snippet |
 | `web_save` | force-cache a url (pin; exempt from decay until TTL) |
 | `web_forget` | evict a url / matching set from the cache |
+| `web_distill` | LLM-curate cached pages into knowledge (summary · key points · entities · tags); `url` → that page (fetch-if-uncached, free re-ask on unchanged content), no `url` → bounded sweep of pending pages. Explicit-only — nothing spends tokens on its own |
 
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.
@@ -147,6 +148,10 @@ UI can render what the agent is reading. Pure-MCP consumers ignore it.
 | `OCCIPITAL_SEARXNG_URL` | unset | SearXNG instance base URL |
 | `OCCIPITAL_<PROVIDER>_KEY` | unset | keyed-provider API key (per provider); overrides the key file |
 | `OCCIPITAL_KEYS_FILE` | `<data_dir>/occipital/keys.json` | persisted provider-key store (0600); managed via `occipital keys set/list/rm` |
+| `OCCIPITAL_CURATE_BACKEND` | `auto` | distillation LLM: `auto` (Ollama → Anthropic fallback) \| `ollama` \| `anthropic` \| `off` — mirrors Cerebro's `CEREBRO_VISION_BACKEND` tiering |
+| `OCCIPITAL_CURATE_URL` | `http://localhost:11434` | Ollama endpoint — point at a LAN inference node to hot-swap the curation backend |
+| `OCCIPITAL_CURATE_MODEL` | `llama3.2` | Ollama curation model (small text model) |
+| `OCCIPITAL_CURATE_API_MODEL` | `claude-haiku-4-5` | Anthropic curation model (needs `ANTHROPIC_API_KEY`, inherited from the host process env — on an ApexOS node the plugin inherits agentd's) |
 
 Keys are managed via CLI/API CRUD too (stored 0600), not only env — mirror agentd's token file.
 
