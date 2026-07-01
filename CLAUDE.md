@@ -152,6 +152,9 @@ UI can render what the agent is reading. Pure-MCP consumers ignore it.
 | `OCCIPITAL_CURATE_URL` | `http://localhost:11434` | Ollama endpoint — point at a LAN inference node to hot-swap the curation backend |
 | `OCCIPITAL_CURATE_MODEL` | `llama3.2` | Ollama curation model (small text model) |
 | `OCCIPITAL_CURATE_API_MODEL` | `claude-haiku-4-5` | Anthropic curation model (needs `ANTHROPIC_API_KEY`, inherited from the host process env — on an ApexOS node the plugin inherits agentd's) |
+| `OCCIPITAL_AUTO_DISTILL` | `off` | background auto-curation in the resident servers: `off` \| `local` (Ollama-pinned — never spends API tokens) \| `on` (the configured backend, API fallback included). The "living" knob — pages distill themselves as they're read |
+| `OCCIPITAL_AUTO_DISTILL_INTERVAL_SECS` | `300` | seconds between background sweep ticks (floor 30) |
+| `OCCIPITAL_AUTO_DISTILL_CAP` | `50` | max distillations per rolling 24 h before auto pauses (counts explicit ones too — a total-spend guard; `0` = uncapped) |
 
 Keys are managed via CLI/API CRUD too (stored 0600), not only env — mirror agentd's token file.
 

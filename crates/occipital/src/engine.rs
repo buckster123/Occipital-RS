@@ -13,7 +13,7 @@ use crate::cache::Cache;
 use crate::config::{
     Config, DEFAULT_DECAY_HALFLIFE_SECS, DEFAULT_GC_MIN_AGE_SECS, DEFAULT_GC_MIN_SALIENCE,
 };
-use crate::curate::{make_distiller, Distiller};
+use crate::curate::{make_auto_distiller, make_distiller, Distiller};
 use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Page};
@@ -77,6 +77,11 @@ pub struct Engine {
     cache:              Option<Arc<Cache>>,
     embedder:           Option<Arc<dyn Embedder>>,
     distiller:          Option<Arc<dyn Distiller>>,
+    /// The background-sweep distiller (`OCCIPITAL_AUTO_DISTILL`) — may differ
+    /// from `distiller` (`local` pins it to Ollama-only). `None` = auto off.
+    auto_distiller:     Option<Arc<dyn Distiller>>,
+    /// Rolling-24h distillation budget for the background sweep (0 = uncapped).
+    auto_cap:           usize,
     top_n:              usize,
     fresh_ttl_secs:     u64,
     decay_half_life_secs: u64,
@@ -102,6 +107,8 @@ impl Engine {
             cache,
             embedder: make_embedder(&cfg.embed_model),
             distiller: make_distiller(&cfg.curate),
+            auto_distiller: make_auto_distiller(&cfg.curate),
+            auto_cap: cfg.curate.auto_cap,
             top_n: cfg.search_top_n,
             fresh_ttl_secs: cfg.fresh_ttl_secs,
             decay_half_life_secs: cfg.decay_half_life_secs,
@@ -127,6 +134,8 @@ impl Engine {
             cache,
             embedder: None,
             distiller: None,
+            auto_distiller: None,
+            auto_cap: 0,
             top_n,
             fresh_ttl_secs,
             decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
@@ -142,6 +151,12 @@ impl Engine {
 
     pub fn with_distiller(mut self, distiller: Option<Arc<dyn Distiller>>) -> Self {
         self.distiller = distiller;
+        self
+    }
+
+    pub fn with_auto_distiller(mut self, distiller: Option<Arc<dyn Distiller>>, cap: usize) -> Self {
+        self.auto_distiller = distiller;
+        self.auto_cap = cap;
         self
     }
 
@@ -382,34 +397,51 @@ impl Engine {
             None => cache.undistilled_urls(limit.unwrap_or(DEFAULT_DISTILL_SWEEP).clamp(1, 10))?,
         };
 
-        for target in targets {
-            let Some(row) = cache.get_page(&target)? else { continue };
-            match distiller.distill_page(&row.page).await {
-                Ok(d) => {
-                    cache.put_distillation(&target, &d, &row.page.content_hash)?;
-                    distilled.push(DistilledPage {
-                        url:        target,
-                        title:      row.page.title,
-                        summary:    d.summary,
-                        key_points: d.key_points,
-                        entities:   d.entities,
-                        tags:       d.tags,
-                        model:      d.model,
-                        backend:    d.backend.to_string(),
-                        from_cache: false,
-                    });
-                }
-                Err(e) => failed.push(DistillFailure { url: target, error: e.to_string() }),
-            }
-        }
+        let (mut done, mut errs) = distill_targets(cache, distiller.as_ref(), targets).await?;
+        distilled.append(&mut done);
+        failed.append(&mut errs);
 
         let remaining = cache.undistilled_count()?;
         Ok(DistillReport { distilled, failed, remaining })
     }
 
+    /// One background auto-curation sweep (the resident servers call this on an
+    /// interval). Returns `None` when there is nothing to do: auto-distill off,
+    /// no cache, the rolling-24h budget spent, or no pending pages. The batch is
+    /// bounded by the sweep default AND the remaining budget.
+    pub async fn auto_distill_tick(&self) -> anyhow::Result<Option<DistillReport>> {
+        let Some(distiller) = &self.auto_distiller else { return Ok(None) };
+        let Some(cache) = &self.cache else { return Ok(None) };
+
+        let batch = if self.auto_cap == 0 {
+            DEFAULT_DISTILL_SWEEP
+        } else {
+            let spent = cache.distilled_since(Utc::now() - chrono::Duration::hours(24))?;
+            if spent >= self.auto_cap {
+                tracing::debug!(spent, cap = self.auto_cap, "auto-distill budget spent — pausing");
+                return Ok(None);
+            }
+            DEFAULT_DISTILL_SWEEP.min(self.auto_cap - spent)
+        };
+
+        let targets = cache.undistilled_urls(batch)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let (distilled, failed) = distill_targets(cache, distiller.as_ref(), targets).await?;
+        let remaining = cache.undistilled_count()?;
+        Ok(Some(DistillReport { distilled, failed, remaining }))
+    }
+
     /// Whether LLM curation is active (a distiller is configured).
     pub fn curation(&self) -> bool {
         self.distiller.is_some()
+    }
+
+    /// Whether background auto-curation is active (the servers gate their
+    /// sweep task on this).
+    pub fn auto_curation(&self) -> bool {
+        self.auto_distiller.is_some()
     }
 
     /// Garbage-collect stale memory: prune unpinned pages whose **effective
@@ -456,6 +488,39 @@ impl Engine {
     pub fn semantic(&self) -> bool {
         self.embedder.is_some()
     }
+}
+
+/// Distill each target page and store the result — the shared loop behind the
+/// explicit verb and the background tick. Per-page fail-soft: one bad page
+/// lands in `failed` and the loop continues.
+async fn distill_targets(
+    cache: &Cache,
+    distiller: &dyn Distiller,
+    targets: Vec<String>,
+) -> anyhow::Result<(Vec<DistilledPage>, Vec<DistillFailure>)> {
+    let mut distilled = Vec::new();
+    let mut failed = Vec::new();
+    for target in targets {
+        let Some(row) = cache.get_page(&target)? else { continue };
+        match distiller.distill_page(&row.page).await {
+            Ok(d) => {
+                cache.put_distillation(&target, &d, &row.page.content_hash)?;
+                distilled.push(DistilledPage {
+                    url:        target,
+                    title:      row.page.title,
+                    summary:    d.summary,
+                    key_points: d.key_points,
+                    entities:   d.entities,
+                    tags:       d.tags,
+                    model:      d.model,
+                    backend:    d.backend.to_string(),
+                    from_cache: false,
+                });
+            }
+            Err(e) => failed.push(DistillFailure { url: target, error: e.to_string() }),
+        }
+    }
+    Ok((distilled, failed))
 }
 
 /// Cache key for a search: provider + limit + normalized query, so the same ask
@@ -757,6 +822,53 @@ mod tests {
         let err = e.distill(None, None).await.unwrap_err().to_string();
         assert!(err.contains("curation disabled"), "got: {err}");
         assert!(!e.curation());
+    }
+
+    // ---- auto-distillation (the background tick) ---------------------------
+
+    #[tokio::test]
+    async fn auto_tick_is_a_noop_when_auto_is_off() {
+        // A main distiller alone does NOT enable the background sweep.
+        let e = engine(Counting::new(HTML), 3600).with_distiller(Some(MockDistiller::new()));
+        e.fetch("https://e.test/", false).await.unwrap();
+        assert!(!e.auto_curation());
+        assert!(e.auto_distill_tick().await.unwrap().is_none());
+        assert_eq!(e.stats().unwrap().distilled, 0);
+    }
+
+    #[tokio::test]
+    async fn auto_tick_sweeps_pending_pages_then_goes_quiet() {
+        let mock = MockDistiller::new();
+        let e = engine(Counting::new(HTML), 3600).with_auto_distiller(Some(mock.clone()), 0);
+        e.fetch("https://e.test/a", false).await.unwrap();
+        e.fetch("https://e.test/b", false).await.unwrap();
+
+        let report = e.auto_distill_tick().await.unwrap().expect("swept");
+        assert_eq!(report.distilled.len(), 2);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(mock.calls(), 2);
+
+        // Nothing pending → quiet tick, zero LLM calls.
+        assert!(e.auto_distill_tick().await.unwrap().is_none());
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_tick_honors_the_rolling_budget() {
+        let mock = MockDistiller::new();
+        // Cap = 1 distillation per 24 h.
+        let e = engine(Counting::new(HTML), 3600).with_auto_distiller(Some(mock.clone()), 1);
+        e.fetch("https://e.test/a", false).await.unwrap();
+        e.fetch("https://e.test/b", false).await.unwrap();
+
+        // First tick: batch is clamped to the remaining budget (1 of 2 pages).
+        let report = e.auto_distill_tick().await.unwrap().expect("swept one");
+        assert_eq!(report.distilled.len(), 1);
+        assert_eq!(report.remaining, 1);
+
+        // Budget spent → the next tick pauses even with a page still pending.
+        assert!(e.auto_distill_tick().await.unwrap().is_none());
+        assert_eq!(mock.calls(), 1, "cap held");
     }
 
     // ---- decay & GC (Phase 6) -------------------------------------------
