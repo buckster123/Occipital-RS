@@ -4,12 +4,12 @@
 //! search providers, and a Cerebro-style decaying knowledge cache. Three thin
 //! binaries (`occipital-mcp` / `-api` / `-cli`) drive this one library.
 //!
-//! Build status: **Phase 15 — agent browsing: sessions & identity**.
-//! Phases 0–14 complete (standalone, the ApexOS follow-along UI, the knowledge
-//! hub, the page model, the interaction verbs, SPA salvage); [`session`] adds
-//! the **opt-in** persistent cookie jar, per-domain header rules (the honest UA
-//! stays locked), and an explicit proxy — one jar, one identity. See
-//! `docs/agent-browsing.md` + `docs/politeness.md`.
+//! Build status: **Phase 16 — the agent-browsing expansion is complete**.
+//! Phases 0–16: the polite fetcher + reader-mode + cache + decay + knowledge
+//! hub, then browsing — the interactive page model, `click`/`submit`, SPA
+//! salvage, sessions & identity, and multi-step politeness hygiene (robots
+//! `Crawl-delay` honored, eTLD+1 rate buckets, TTL'd robots cache, a bounded
+//! request log). See `docs/agent-browsing.md` + `docs/politeness.md`.
 
 pub mod cache;
 pub mod config;

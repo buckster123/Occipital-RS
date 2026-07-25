@@ -7,14 +7,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use crate::config::Config;
-use crate::ratelimit::{backoff_delay, DomainLimiter};
+use crate::ratelimit::{backoff_delay, registrable_domain, DomainLimiter};
 use crate::robots::Robots;
 use crate::session::{merge_headers, CookieJar, HeaderRules};
 
@@ -126,15 +128,47 @@ const BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 const JITTER_FRAC: f64 = 0.3;
 
+/// Ceiling on a robots `Crawl-delay` we will honor. Sites occasionally publish
+/// absurd values (hours); obeying literally would hang the agent, so we clamp
+/// and say so in the log rather than pretending to comply.
+const MAX_CRAWL_DELAY: Duration = Duration::from_secs(60);
+
+/// One completed network attempt — the honest record of what we did (the
+/// "network interception" reframe: we *are* the network stack, so observability
+/// is a feature, not a hack).
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestEntry {
+    pub at:          DateTime<Utc>,
+    pub method:      String,
+    pub url:         String,
+    /// `None` when the request never produced a response (error / blocked).
+    pub status:      Option<u16>,
+    /// Milliseconds spent waiting on the per-domain politeness budget.
+    pub wait_ms:     u64,
+    /// Milliseconds spent on the wire.
+    pub duration_ms: u64,
+    pub error:       Option<String>,
+}
+
+/// Where request records go. The cache implements this; `fetch` stays the
+/// bottom layer and never learns about SQLite.
+pub trait RequestSink: Send + Sync {
+    fn record(&self, entry: RequestEntry);
+}
+
 pub struct PoliteFetcher {
     client:         reqwest::Client,
     limiter:        DomainLimiter,
     sem:            Semaphore,
-    robots:         Mutex<HashMap<String, Arc<Robots>>>,
+    /// host → (rules, fetched_at). Re-fetched once past `robots_ttl`.
+    robots:         Mutex<HashMap<String, (Arc<Robots>, Instant)>>,
+    robots_ttl:     Duration,
     respect_robots: bool,
     ua_token:       String,
     max_body_bytes: usize,
     max_retries:    u32,
+    /// Optional request log (wired to the cache by the engine).
+    sink:           Option<Arc<dyn RequestSink>>,
     /// Operator-configured per-domain headers (empty by default).
     header_rules:   HeaderRules,
     /// The session jar, when `OCCIPITAL_COOKIES` is on. Held so the fetcher can
@@ -186,18 +220,33 @@ impl PoliteFetcher {
             tracing::info!("per-domain header rules loaded");
         }
 
+        if !cfg.respect_robots {
+            tracing::warn!(
+                "OCCIPITAL_RESPECT_ROBOTS is off — robots.txt will NOT be honored; \
+                 only do this on hosts you are authorized to crawl"
+            );
+        }
+
         Ok(Self {
             client: builder.build()?,
             limiter:        DomainLimiter::new(cfg.rate_per_domain, JITTER_FRAC),
             sem:            Semaphore::new(cfg.max_concurrency.max(1)),
             robots:         Mutex::new(HashMap::new()),
+            robots_ttl:     Duration::from_secs(cfg.robots_ttl_secs),
             respect_robots: cfg.respect_robots,
             ua_token:       ua_token(&cfg.user_agent),
             max_body_bytes: cfg.max_body_bytes,
             max_retries:    cfg.max_retries,
             header_rules,
             cookies,
+            sink:           None,
         })
+    }
+
+    /// Attach a request log (the engine wires this to the cache).
+    pub fn with_sink(mut self, sink: Option<Arc<dyn RequestSink>>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// The live session jar (`None` when cookies are off) — CLI/ops surface.
@@ -205,35 +254,88 @@ impl PoliteFetcher {
         self.cookies.clone()
     }
 
-    /// The rate-limit bucket key for a URL. Host-level for now; eTLD+1 grouping
-    /// (so sibling subdomains share a budget) is a deliberate later refinement.
-    fn rate_key(url: &Url) -> String {
-        url.host_str().unwrap_or("").to_ascii_lowercase()
+    fn log(&self, method: Method, url: &str, status: Option<u16>, wait: Duration, started: Instant, error: Option<String>) {
+        let Some(sink) = &self.sink else { return };
+        sink.record(RequestEntry {
+            at:          Utc::now(),
+            method:      match method {
+                Method::Get => "GET".into(),
+                Method::Post => "POST".into(),
+            },
+            url:         url.to_string(),
+            status,
+            wait_ms:     wait.as_millis() as u64,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error,
+        });
     }
 
-    /// Fetch + cache a host's robots.txt. A missing/unreadable file → allow-all.
-    /// The robots.txt request is itself throttled (it's a hit on the domain) but
-    /// not robots-gated (no recursion).
-    async fn robots_for(&self, scheme: &str, host: &str) -> Arc<Robots> {
-        if let Some(r) = self.robots.lock().await.get(host) {
-            return r.clone();
+    /// The rate-limit bucket key for a URL: the **registrable domain**, so
+    /// sibling subdomains share one site budget instead of each opening a fresh
+    /// one (a multi-step browse must not out-pace the site's budget by hopping
+    /// `www.` → `api.` → `cdn.`).
+    fn rate_key(url: &Url) -> String {
+        registrable_domain(url.host_str().unwrap_or(""))
+    }
+
+    /// Fetch + cache an **origin's** robots.txt, re-checking once the cached
+    /// copy is older than the TTL (a long-running node must notice policy
+    /// changes). A missing/unreadable file → allow-all. The robots.txt request
+    /// is itself throttled (it's a hit on the domain) but not robots-gated (no
+    /// recursion).
+    ///
+    /// Keyed by origin (scheme + host + **port**), because robots.txt is
+    /// per-origin: a site on a non-default port has its own policy file.
+    ///
+    /// A `Crawl-delay` here raises that domain's rate-limit interval — the
+    /// promise politeness.md has always made, now kept.
+    async fn robots_for(&self, url: &Url, bucket: &str) -> Arc<Robots> {
+        let origin = url.origin().ascii_serialization();
+        if let Some((r, fetched)) = self.robots.lock().await.get(&origin) {
+            if fetched.elapsed() < self.robots_ttl {
+                return r.clone();
+            }
         }
-        self.limiter.throttle(host).await;
+        self.limiter.throttle(bucket).await;
         let robots = {
             let _permit = self.sem.acquire().await.ok();
-            let url = format!("{scheme}://{host}/robots.txt");
-            match self.client.get(&url).send().await {
-                Ok(r) if r.status().is_success() => {
-                    let txt = r.text().await.unwrap_or_default();
-                    Robots::parse(&txt, &self.ua_token)
-                }
-                _ => Robots::allow_all(),
+            match robots_url(url) {
+                Some(robots_url) => match self.client.get(robots_url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        let txt = r.text().await.unwrap_or_default();
+                        Robots::parse(&txt, &self.ua_token)
+                    }
+                    _ => Robots::allow_all(),
+                },
+                None => Robots::allow_all(),
             }
         };
+        if let Some(secs) = robots.crawl_delay {
+            if secs > 0.0 {
+                let asked = Duration::from_secs_f64(secs);
+                let applied = asked.min(MAX_CRAWL_DELAY);
+                if applied < asked {
+                    tracing::warn!(
+                        %origin, asked_secs = secs, capped_secs = applied.as_secs_f64(),
+                        "Crawl-delay clamped to the ceiling"
+                    );
+                }
+                if self.limiter.set_min_interval(bucket, applied) {
+                    tracing::info!(bucket, secs = applied.as_secs_f64(), "honoring robots Crawl-delay");
+                }
+            }
+        }
         let robots = Arc::new(robots);
-        self.robots.lock().await.insert(host.to_string(), robots.clone());
+        self.robots.lock().await.insert(origin, (robots.clone(), Instant::now()));
         robots
     }
+}
+
+/// The robots.txt URL for a request URL — same origin, **port preserved**.
+/// (`host_str()` drops the port, which silently skipped robots.txt for any
+/// site not on 80/443.)
+fn robots_url(url: &Url) -> Option<Url> {
+    url.join("/robots.txt").ok()
 }
 
 impl PoliteFetcher {
@@ -266,8 +368,9 @@ impl PoliteFetcher {
             }
             _ => headers,
         };
-        self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
+        let wait = self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
+        let started = Instant::now();
         let retriable = method_retriable(method);
         let mut attempt = 0u32;
         loop {
@@ -294,7 +397,9 @@ impl PoliteFetcher {
                     }
                     if let Some(len) = resp.content_length() {
                         if len as usize > self.max_body_bytes {
-                            anyhow::bail!("body too large: {len} bytes > cap {}", self.max_body_bytes);
+                            let msg = format!("body too large: {len} bytes > cap {}", self.max_body_bytes);
+                            self.log(method, parsed.as_str(), Some(status.as_u16()), wait, started, Some(msg.clone()));
+                            anyhow::bail!(msg);
                         }
                     }
                     let header = |h: reqwest::header::HeaderName| {
@@ -307,6 +412,7 @@ impl PoliteFetcher {
                     let status_u16 = status.as_u16();
                     let mut body = resp.bytes().await?.to_vec();
                     body.truncate(self.max_body_bytes); // backstop for chunked/no-length
+                    self.log(method, &final_url, Some(status_u16), wait, started, None);
                     return Ok(FetchResponse {
                         final_url,
                         status: status_u16,
@@ -319,11 +425,12 @@ impl PoliteFetcher {
                 }
                 Err(e) => {
                     if retriable && attempt < self.max_retries && (e.is_timeout() || e.is_connect()) {
-                        let wait = backoff_delay(attempt, BACKOFF_BASE, BACKOFF_CAP);
+                        let backoff = backoff_delay(attempt, BACKOFF_BASE, BACKOFF_CAP);
                         attempt += 1;
-                        tokio::time::sleep(wait).await;
+                        tokio::time::sleep(backoff).await;
                         continue;
                     }
+                    self.log(method, parsed.as_str(), None, wait, started, Some(e.to_string()));
                     return Err(e.into());
                 }
             }
@@ -334,13 +441,16 @@ impl PoliteFetcher {
         if !self.respect_robots {
             return Ok(());
         }
-        if let Some(host) = parsed.host_str() {
-            let robots = self.robots_for(parsed.scheme(), host).await;
+        if parsed.host_str().is_some() {
+            let robots = self.robots_for(parsed, &Self::rate_key(parsed)).await;
             let path_q = match parsed.query() {
                 Some(q) => format!("{}?{}", parsed.path(), q),
                 None => parsed.path().to_string(),
             };
             if !robots.allowed(&path_q) {
+                // A refusal is part of the trail: the log should show *why*
+                // nothing was fetched.
+                self.log(Method::Get, url, None, Duration::ZERO, Instant::now(), Some("blocked by robots.txt".into()));
                 anyhow::bail!("blocked by robots.txt: {url}");
             }
         }
@@ -438,9 +548,23 @@ mod tests {
     }
 
     #[test]
-    fn rate_key_is_host_lowercased() {
+    fn rate_key_is_the_registrable_domain() {
         let u = Url::parse("https://Example.COM/a/b?q=1").unwrap();
         assert_eq!(PoliteFetcher::rate_key(&u), "example.com");
+        // Sibling subdomains share one site budget.
+        let a = Url::parse("https://www.example.com/x").unwrap();
+        let b = Url::parse("https://api.example.com/y").unwrap();
+        assert_eq!(PoliteFetcher::rate_key(&a), PoliteFetcher::rate_key(&b));
+    }
+
+    #[test]
+    fn robots_url_keeps_the_port() {
+        // Regression: `host_str()` drops the port, so robots.txt was fetched
+        // from :80 and 404'd into allow-all — silently unpoliced.
+        let u = Url::parse("http://127.0.0.1:8791/deep/page.html?q=1").unwrap();
+        assert_eq!(robots_url(&u).unwrap().as_str(), "http://127.0.0.1:8791/robots.txt");
+        let u = Url::parse("https://example.com/a/b").unwrap();
+        assert_eq!(robots_url(&u).unwrap().as_str(), "https://example.com/robots.txt");
     }
 
     #[test]

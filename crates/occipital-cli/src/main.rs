@@ -12,6 +12,12 @@ use occipital::{Config, Engine, Keys};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Honor robots.txt (default: on). `--obey-robots=false` disables it —
+    /// only for hosts you are authorized to crawl. Overrides
+    /// OCCIPITAL_RESPECT_ROBOTS for this invocation.
+    #[arg(long, global = true, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+    obey_robots: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -48,6 +54,12 @@ enum Command {
         /// Sweep size when no URL is given (default 3, max 10).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Show the recent request trail (what was sent, waited, and refused).
+    Log {
+        /// Rows to show (newest first).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Run cache garbage-collection (decay-based pruning).
     Gc,
@@ -103,7 +115,10 @@ enum KeysAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
+    if let Some(obey) = cli.obey_robots {
+        config.respect_robots = obey;
+    }
 
     match cli.command {
         Command::Search { query } => {
@@ -233,6 +248,24 @@ async fn main() -> anyhow::Result<()> {
                 config.curate.auto, config.curate.auto_interval_secs,
                 if config.curate.auto_cap == 0 { "∞".to_string() } else { config.curate.auto_cap.to_string() }
             );
+        }
+        Command::Log { limit } => {
+            let engine = Engine::from_config(&config)?;
+            let rows = engine.log(limit)?;
+            if rows.is_empty() {
+                println!("(no requests logged)");
+            }
+            for r in &rows {
+                let status = match (&r.status, &r.error) {
+                    (Some(s), _) => s.to_string(),
+                    (None, Some(e)) => format!("— {e}"),
+                    (None, None) => "—".into(),
+                };
+                println!(
+                    "{}  {:<4} {}  [{}]  waited {}ms, took {}ms",
+                    r.at, r.method, r.url, status, r.wait_ms, r.duration_ms
+                );
+            }
         }
         Command::Gc => {
             let engine = Engine::from_config(&config)?;

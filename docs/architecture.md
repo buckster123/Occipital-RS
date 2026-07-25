@@ -18,7 +18,7 @@ The core lib `occipital` is a pipeline with a cache wrapped around it. The three
 
 | Module | Responsibility |
 |--------|----------------|
-| `fetch` | the polite HTTP layer — one `reqwest` client behind a per-domain rate limiter, jitter, backoff, robots cache, honest UA. The only thing that touches the network. Behind a `Fetcher` trait so everything above it is testable with a mock. |
+| `fetch` | the polite HTTP layer — one `reqwest` client behind a per-registrable-domain rate limiter (eTLD+1 buckets, robots `Crawl-delay` raising the interval), jitter, backoff, an origin-keyed TTL'd robots cache, honest UA. The only thing that touches the network. Behind a `Fetcher` trait so everything above it is testable with a mock; a `RequestSink` seam feeds the request log without `fetch` knowing about SQLite. |
 | `extract` | HTML → `Page { title, byline, markdown, links, forms, salvaged, js_required, content_hash }`. Readability-style boilerplate strip; never returns raw HTML as prose. Phase 12: forms are extracted document-wide with stable 1-based ordinals (the element registry) and render as one-line annotated blocks in the reader view — the interaction handles for the click/submit verbs. |
 | `salvage` | the no-JS SPA path (Phase 14): when extraction is thin, mine `ld+json`, framework state blobs (`__NEXT_DATA__` etc. — strict JSON only, nothing executed), `noscript`, meta descriptions, and feeds; flag `salvaged` on success, `js_required` on a scripts-heavy shell with nothing recoverable. |
 | `providers` | the `SearchProvider` trait + impls: `duckduckgo` (HTML scrape), `searxng` (JSON), `brave`/`tavily`/`bing` (keyed). Normalizes to `Vec<SearchResult>`. |
@@ -62,6 +62,11 @@ distillations (                       -- LLM curation (the knowledge hub layer)
   model TEXT, distilled_at TEXT
 )
 distill_fts (url, summary, terms)     -- FTS5 over curated text; unioned into keyword recall
+requests (                            -- the honest trail (Phase 16), bounded
+  id INTEGER PRIMARY KEY, at TEXT, method TEXT, url TEXT,
+  status INTEGER,                     -- NULL when refused or errored
+  wait_ms INTEGER, duration_ms INTEGER, error TEXT
+)
 snapshots (                           -- interaction working memory (Phase 12)
   url TEXT PRIMARY KEY,               -- cascade-deleted with the page
   html TEXT,                          -- raw fetched HTML (body-cap bounded)

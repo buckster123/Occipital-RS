@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, CacheLog, RequestRow};
 use crate::config::{
     Config, DEFAULT_DECAY_HALFLIFE_SECS, DEFAULT_GC_MIN_AGE_SECS, DEFAULT_GC_MIN_SALIENCE,
     DEFAULT_SNAPSHOT_TTL_SECS,
@@ -190,7 +190,6 @@ pub struct Engine {
 impl Engine {
     /// Build the production engine: polite fetcher + config provider + on-disk cache.
     pub fn from_config(cfg: &Config) -> anyhow::Result<Self> {
-        let fetcher: Arc<dyn Fetcher> = Arc::new(PoliteFetcher::new(cfg)?);
         let cache = match Cache::open(&cfg.db_path) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
@@ -198,6 +197,12 @@ impl Engine {
                 None
             }
         };
+        // The request log lives in the cache; `fetch` only knows the sink seam.
+        let sink: Option<Arc<dyn crate::fetch::RequestSink>> = match (&cache, cfg.log_max) {
+            (Some(c), max) if max > 0 => Some(Arc::new(CacheLog::new(c.clone(), max))),
+            _ => None,
+        };
+        let fetcher: Arc<dyn Fetcher> = Arc::new(PoliteFetcher::new(cfg)?.with_sink(sink));
         let keys = Keys::load(&cfg.keys_file);
         Ok(Self {
             fetcher,
@@ -772,6 +777,15 @@ impl Engine {
     /// Cache size counters (`None` if no cache).
     pub fn stats(&self) -> Option<crate::cache::CacheStats> {
         self.cache.as_ref().map(|c| c.stats())
+    }
+
+    /// The recent request trail (newest first) — what this node actually sent,
+    /// what it cost, and what was refused.
+    pub fn log(&self, limit: usize) -> anyhow::Result<Vec<RequestRow>> {
+        match &self.cache {
+            Some(c) => c.recent_requests(limit.clamp(1, 500)),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Whether semantic recall is active (embeddings loaded) vs FTS5 keyword.
