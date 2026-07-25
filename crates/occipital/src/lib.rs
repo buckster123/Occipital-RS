@@ -4,11 +4,12 @@
 //! search providers, and a Cerebro-style decaying knowledge cache. Three thin
 //! binaries (`occipital-mcp` / `-api` / `-cli`) drive this one library.
 //!
-//! Build status: **Phase 13 — agent browsing: the interaction verbs**.
-//! Phases 0–12 complete (standalone, the ApexOS follow-along UI, the knowledge
-//! hub, the interactive page model); [`engine`] now has hands — `click` (by
-//! registry ordinal) and `submit` (fill + GET/POST, POST deliberate-only and
-//! never auto-retried) — see `docs/agent-browsing.md` + `docs/build-roadmap.md`.
+//! Build status: **Phase 14 — agent browsing: SPA salvage + honest JS signaling**.
+//! Phases 0–13 complete (standalone, the ApexOS follow-along UI, the knowledge
+//! hub, the page model, the interaction verbs); thin pages now mine the data
+//! embedded in static HTML (`salvaged: true`) and truly client-only pages say
+//! so (`js_required: true`) — no script is ever executed. See
+//! `docs/agent-browsing.md` + `docs/build-roadmap.md`.
 
 pub mod cache;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod keys;
 pub mod providers;
 pub mod ratelimit;
 pub mod robots;
+mod salvage;
 
 pub use cache::{Cache, CacheStats};
 pub use config::{Config, Tier};

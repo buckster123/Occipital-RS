@@ -93,6 +93,11 @@ pub struct DomView {
     pub content_hash: String,
     pub from_cache:   bool,
     pub snapshot:     bool,
+    /// The page's content was mined from embedded data (the registry may be
+    /// leaner than the rendered app would show).
+    pub salvaged:     bool,
+    /// Client-only page — the registry is what static HTML yields, no more.
+    pub js_required:  bool,
 }
 
 /// What an element selector (`web_click`) addresses: `link:N` or `form:N`.
@@ -398,6 +403,8 @@ impl Engine {
             content_hash: page.content_hash,
             from_cache,
             snapshot,
+            salvaged: page.salvaged,
+            js_required: page.js_required,
         })
     }
 
@@ -1158,6 +1165,8 @@ mod tests {
             markdown: body.into(),
             links: vec![],
             forms: vec![],
+            salvaged: false,
+            js_required: false,
             content_hash: "h".into(),
         }
     }
