@@ -20,6 +20,8 @@ enum Command {
     Search { query: String },
     /// Fetch a URL as reader-mode Markdown.
     Fetch { url: String },
+    /// Show a page's element registry — links + forms with stable ordinals.
+    Dom { url: String },
     /// Recall from already-read (cached) pages only.
     Recall { query: String },
     /// Distill cached pages into curated knowledge (summary/points/entities/tags).
@@ -73,6 +75,30 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[served from cache]");
             }
             println!("{}", page.markdown);
+        }
+        Command::Dom { url } => {
+            let engine = Engine::from_config(&config)?;
+            let view = engine.dom(&url, false).await?;
+            if view.from_cache {
+                eprintln!("[served from cache]");
+            }
+            println!("{}  {}", view.url, view.title.as_deref().unwrap_or("(untitled)"));
+            println!("snapshot: {}", if view.snapshot { "held" } else { "expired/none" });
+            if !view.forms.is_empty() {
+                println!("\nforms:");
+                for f in &view.forms {
+                    let fields = f.fields.iter()
+                        .map(|x| format!("{} \"{}\"", x.kind, x.name))
+                        .collect::<Vec<_>>().join(" · ");
+                    println!("  #{} {} {} — {}", f.idx, f.method.to_uppercase(), f.action, fields);
+                }
+            }
+            if !view.links.is_empty() {
+                println!("\nlinks:");
+                for l in &view.links {
+                    println!("  #{} {} — {}", l.idx, l.text, l.url);
+                }
+            }
         }
         Command::Recall { query } => {
             let engine = Engine::from_config(&config)?;

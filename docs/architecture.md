@@ -19,9 +19,9 @@ The core lib `occipital` is a pipeline with a cache wrapped around it. The three
 | Module | Responsibility |
 |--------|----------------|
 | `fetch` | the polite HTTP layer — one `reqwest` client behind a per-domain rate limiter, jitter, backoff, robots cache, honest UA. The only thing that touches the network. Behind a `Fetcher` trait so everything above it is testable with a mock. |
-| `extract` | HTML → `Page { title, byline, markdown, links, content_hash }`. Readability-style boilerplate strip; never returns raw HTML. |
+| `extract` | HTML → `Page { title, byline, markdown, links, forms, content_hash }`. Readability-style boilerplate strip; never returns raw HTML as prose. Phase 12: forms are extracted document-wide with stable 1-based ordinals (the element registry) and render as one-line annotated blocks in the reader view — the interaction handles for the coming click/submit verbs. |
 | `providers` | the `SearchProvider` trait + impls: `duckduckgo` (HTML scrape), `searxng` (JSON), `brave`/`tavily`/`bing` (keyed). Normalizes to `Vec<SearchResult>`. |
-| `cache` | the read-through store: SQLite (`pages`, `searches`, `distillations`), FTS5, optional embeddings. First-hit lookup, conditional-GET refresh, write-back. |
+| `cache` | the read-through store: SQLite (`pages`, `searches`, `distillations`, `snapshots`), FTS5, optional embeddings. First-hit lookup, conditional-GET refresh, write-back. Snapshots (raw HTML, TTL-pruned) are interaction working memory, never recalled. |
 | `curate` | the distillation layer (the knowledge hub): a tiered LLM `Distiller` (Ollama local/LAN → Anthropic API, mirroring Cerebro's `describe_image`) turns a cached page into summary/key-points/entities/tags. Explicit via `web_distill`/CLI/API; **opt-in background auto-curation** (`OCCIPITAL_AUTO_DISTILL` — `local` pins the sweep to Ollama so it never spends API tokens; rolling-24h budget cap) makes pages distill themselves as they're read. Recall serves the distillation over the raw body, and distilled terms are FTS-indexed so curation widens even Nano keyword recall. Talks to an inference endpoint, not the open web — plain reqwest, not the polite `Fetcher`. |
 | `decay` | salience update + GC. Web pages lose salience by age + disuse; the GC prunes stale, unread, low-salience pages. The Cerebro-dream-pruning analog. |
 | `rank` | result ordering: `relevance × freshness × salience`. Keeps stale cached pages from outranking fresh signal in semantic/keyword search. |
@@ -37,6 +37,7 @@ pages (
   title         TEXT,
   markdown      TEXT,                 -- reader-mode body
   links         TEXT,                 -- JSON array of {text,url}
+  forms         TEXT,                 -- JSON array of Form (the element registry, Phase 12)
   content_hash  TEXT,                 -- dedup + change detection
   etag          TEXT,                 -- conditional GET
   last_modified TEXT,                 -- conditional GET
@@ -59,6 +60,11 @@ distillations (                       -- LLM curation (the knowledge hub layer)
   model TEXT, distilled_at TEXT
 )
 distill_fts (url, summary, terms)     -- FTS5 over curated text; unioned into keyword recall
+snapshots (                           -- interaction working memory (Phase 12)
+  url TEXT PRIMARY KEY,               -- cascade-deleted with the page
+  html TEXT,                          -- raw fetched HTML (body-cap bounded)
+  fetched_at TEXT                     -- RFC3339; pruned past OCCIPITAL_SNAPSHOT_TTL_SECS
+)
 ```
 
 ## Freshness & the read-through contract
