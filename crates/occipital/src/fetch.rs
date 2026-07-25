@@ -68,6 +68,18 @@ impl HttpRequest {
             robots: false,
         }
     }
+    /// A **robots-gated** urlencoded POST — a form submission (`web_submit`).
+    /// Unlike provider API calls, this targets an arbitrary site, so the full
+    /// politeness contract applies.
+    pub fn post_form(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: Method::Post,
+            url: url.into(),
+            headers: vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
+            body: Some(body.into()),
+            robots: true,
+        }
+    }
 }
 
 /// The fetch seam. Mock it to test everything above the network.
@@ -187,7 +199,9 @@ impl PoliteFetcher {
     /// Throttle → concurrency permit → send (method/headers/body) with polite
     /// backoff on 429/503. The robots check is the caller's responsibility (so
     /// provider API calls skip it). A `304` is returned as-is (empty body) — not
-    /// retried.
+    /// retried. **Only GET is ever retried**: a POST is not idempotent (it may
+    /// have reached the server), so a 429/503/transport error on one returns
+    /// honestly instead of replaying the write (docs/agent-browsing.md).
     async fn send_core(
         &self,
         parsed: Url,
@@ -197,6 +211,7 @@ impl PoliteFetcher {
     ) -> anyhow::Result<FetchResponse> {
         self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
+        let retriable = method_retriable(method);
         let mut attempt = 0u32;
         loop {
             let mut req = match method {
@@ -212,7 +227,7 @@ impl PoliteFetcher {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    if (status.as_u16() == 429 || status.as_u16() == 503) && attempt < self.max_retries {
+                    if retriable && (status.as_u16() == 429 || status.as_u16() == 503) && attempt < self.max_retries {
                         let wait = retry_after(&resp)
                             .unwrap_or_else(|| backoff_delay(attempt, BACKOFF_BASE, BACKOFF_CAP));
                         attempt += 1;
@@ -246,7 +261,7 @@ impl PoliteFetcher {
                     });
                 }
                 Err(e) => {
-                    if attempt < self.max_retries && (e.is_timeout() || e.is_connect()) {
+                    if retriable && attempt < self.max_retries && (e.is_timeout() || e.is_connect()) {
                         let wait = backoff_delay(attempt, BACKOFF_BASE, BACKOFF_CAP);
                         attempt += 1;
                         tokio::time::sleep(wait).await;
@@ -316,6 +331,13 @@ impl Fetcher for PoliteFetcher {
     }
 }
 
+/// Whether a method may be transparently retried after 429/503/transport
+/// errors. Only GET: it is idempotent by contract; a POST may already have
+/// acted on the server, so replaying it is the fetcher's call to refuse.
+fn method_retriable(method: Method) -> bool {
+    matches!(method, Method::Get)
+}
+
 /// Extract the product token from a UA string: `"Occipital/0.1 (…)"` → `"occipital"`.
 fn ua_token(ua: &str) -> String {
     ua.split('/').next().unwrap_or(ua).trim().to_ascii_lowercase()
@@ -342,6 +364,20 @@ mod tests {
     fn ua_token_extracts_the_product() {
         assert_eq!(ua_token("Occipital/0.1 (+https://x; reader)"), "occipital");
         assert_eq!(ua_token("SomeBot"), "somebot");
+    }
+
+    #[test]
+    fn only_get_is_retriable() {
+        assert!(method_retriable(Method::Get));
+        assert!(!method_retriable(Method::Post), "a POST is never replayed");
+    }
+
+    #[test]
+    fn post_form_is_urlencoded_and_robots_gated() {
+        let r = HttpRequest::post_form("https://e.test/contact", b"q=hi".to_vec());
+        assert_eq!(r.method, Method::Post);
+        assert!(r.robots, "form submissions honor robots.txt");
+        assert_eq!(r.headers[0].1, "application/x-www-form-urlencoded");
     }
 
     #[test]

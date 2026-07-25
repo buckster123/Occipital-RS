@@ -137,6 +137,70 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "snapshot":     view.snapshot,
             }))
         }
+        "web_click" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let element = args["element"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("element (link:N or form:N) required"))?;
+            let r = engine.click(url, element).await?;
+            Ok(json!({
+                "kind":         "click",
+                "element":      r.element,
+                "source_url":   r.source_url,
+                "target_url":   r.target_url,
+                "url":          r.page.url,
+                "title":        r.page.title,
+                "markdown":     r.page.markdown,
+                "links":        r.page.links,
+                "forms":        r.page.forms,
+                "content_hash": r.page.content_hash,
+                "from_cache":   r.from_cache,
+                "status":       r.status,
+            }))
+        }
+        "web_submit" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let form = args["form"]
+                .as_u64()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| anyhow::anyhow!("form (1-based ordinal) required"))?
+                as usize;
+            let fields: Vec<(String, String)> = args["fields"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            let val = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                            (k.clone(), val)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let r = engine.submit(url, form, &fields).await?;
+            Ok(json!({
+                "kind":         "submit",
+                "source_url":   r.source_url,
+                "form":         r.form,
+                "action":       r.action,
+                "method":       r.method,
+                "sent":         r.sent,
+                "status":       r.status,
+                "url":          r.page.url,
+                "title":        r.page.title,
+                "markdown":     r.page.markdown,
+                "links":        r.page.links,
+                "forms":        r.page.forms,
+                "content_hash": r.page.content_hash,
+                "cached":       r.cached,
+            }))
+        }
         "web_save" => {
             let url = args["url"]
                 .as_str()
@@ -234,7 +298,8 @@ mod tests {
         let resp = tools_list(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
         let names: Vec<String> = resp["result"]["tools"].as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        for expected in ["web_search", "web_fetch", "web_dom", "web_recall", "web_save", "web_forget"] {
+        for expected in ["web_search", "web_fetch", "web_dom", "web_click", "web_submit",
+                         "web_recall", "web_save", "web_forget"] {
             assert!(names.contains(&expected.to_string()), "must advertise {expected}: {names:?}");
         }
     }
@@ -282,6 +347,45 @@ mod tests {
         assert_eq!(out["forms"][0]["action"], "https://example.com/search");
         assert_eq!(out["forms"][0]["fields"][0]["name"], "q");
         assert_eq!(out["snapshot"], true, "the read-through fetch left a snapshot");
+    }
+
+    const CLICKABLE: &str = r#"<html><head><title>C</title></head><body><main>
+        <p><a href="/next">next page</a></p>
+        <form action="/search"><input type="text" name="q"><button>Go</button></form>
+        </main></body></html>"#;
+
+    #[tokio::test]
+    async fn web_click_follows_a_link_by_ordinal() {
+        let msg = json!({"jsonrpc":"2.0","id":10,"method":"tools/call",
+            "params":{"name":"web_click","arguments":{"url":"https://example.com/p","element":"link:1"}}});
+        let resp = dispatch_tool(msg, engine_with(CLICKABLE)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "click");
+        assert_eq!(out["target_url"], "https://example.com/next");
+        assert_eq!(out["source_url"], "https://example.com/p");
+        assert!(out["markdown"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn web_submit_fills_and_submits_a_get_form() {
+        let msg = json!({"jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params":{"name":"web_submit","arguments":{
+                "url":"https://example.com/p","form":1,"fields":{"q":"rust"}}}});
+        let resp = dispatch_tool(msg, engine_with(CLICKABLE)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "submit");
+        assert_eq!(out["method"], "get");
+        assert_eq!(out["url"], "https://example.com/search?q=rust");
+        assert_eq!(out["sent"][0]["name"], "q");
+        assert_eq!(out["sent"][0]["value"], "rust");
+    }
+
+    #[tokio::test]
+    async fn web_click_requires_a_valid_element() {
+        let msg = json!({"jsonrpc":"2.0","id":12,"method":"tools/call",
+            "params":{"name":"web_click","arguments":{"url":"https://example.com/p"}}});
+        let resp = dispatch_tool(msg, engine_with(CLICKABLE)).await;
+        assert!(resp["error"]["message"].as_str().unwrap().contains("element"));
     }
 
     #[tokio::test]

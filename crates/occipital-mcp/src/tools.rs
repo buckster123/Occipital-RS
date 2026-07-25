@@ -9,6 +9,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "web_search",
     "web_fetch",
     "web_dom",
+    "web_click",
+    "web_submit",
     "web_recall",
     "web_save",
     "web_forget",
@@ -57,6 +59,31 @@ fn tool_schema(name: &str) -> Value {
                     "fresh": { "type": "boolean", "description": "Bypass the cache and force a live fetch (default: false)" }
                 },
                 "required": ["url"]
+            }
+        }),
+        "web_click" => json!({
+            "name": "web_click",
+            "description": "Click an element on a page by its registry ordinal (see web_dom). element 'link:N' follows that link as a polite GET and returns the reader-mode target page; element 'form:N' submits that form with its current values. Same politeness gates as every fetch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url":     { "type": "string", "description": "The page holding the element" },
+                    "element": { "type": "string", "description": "link:N or form:N — 1-based ordinals from web_dom / web_fetch" }
+                },
+                "required": ["url", "element"]
+            }
+        }),
+        "web_submit" => json!({
+            "name": "web_submit",
+            "description": "Fill and submit a form by its registry ordinal (see web_dom). fields sets named inputs; everything else keeps its current value (hidden state preserved verbatim). GET forms go through the read-through cache (a repeated identical submission costs zero live requests); POST goes live once, is never auto-retried, and its result is never cached. Robots-gated and rate-limited like every fetch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url":    { "type": "string", "description": "The page holding the form" },
+                    "form":   { "type": "integer", "description": "The form's 1-based ordinal from web_dom" },
+                    "fields": { "type": "object", "description": "Field overrides: {\"name\": \"value\", …}; a name the form lacks is an error", "additionalProperties": { "type": "string" } }
+                },
+                "required": ["url", "form"]
             }
         }),
         "web_recall" => json!({
