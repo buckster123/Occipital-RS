@@ -28,6 +28,7 @@ pub struct CacheStats {
     pub searches:   i64,
     pub distilled:  i64,
     pub snapshots:  i64,
+    pub requests:   i64,
 }
 
 /// A cached page plus the metadata the read-through needs (validators for a
@@ -52,6 +53,18 @@ pub struct DistillRow {
     pub content_hash: String,
     pub model:        Option<String>,
     pub distilled_at: String,
+}
+
+/// One row of the request log (what we actually sent, and what it cost).
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestRow {
+    pub at:          String,
+    pub method:      String,
+    pub url:         String,
+    pub status:      Option<u16>,
+    pub wait_ms:     u64,
+    pub duration_ms: u64,
+    pub error:       Option<String>,
 }
 
 /// Lightweight per-page metadata for decay ranking + GC (no body).
@@ -109,6 +122,16 @@ CREATE TABLE IF NOT EXISTS distillations (
     distilled_at TEXT NOT NULL              -- RFC3339
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS distill_fts USING fts5(url UNINDEXED, summary, terms);
+CREATE TABLE IF NOT EXISTS requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          TEXT    NOT NULL,        -- RFC3339
+    method      TEXT    NOT NULL,
+    url         TEXT    NOT NULL,
+    status      INTEGER,                 -- NULL when blocked or errored
+    wait_ms     INTEGER NOT NULL,        -- politeness budget wait
+    duration_ms INTEGER NOT NULL,
+    error       TEXT
+);
 CREATE TABLE IF NOT EXISTS snapshots (
     url        TEXT PRIMARY KEY,            -- FK to pages (cascade in delete_page)
     html       TEXT NOT NULL,               -- raw fetched HTML (body-cap bounded)
@@ -499,6 +522,50 @@ impl Cache {
         Ok(Some((html, parse_ts(&fetched_at)?)))
     }
 
+    // ---- request log (Phase 16: the honest trail) --------------------------
+
+    /// Append one request record, keeping only the newest `max` rows. `max = 0`
+    /// disables the log entirely.
+    pub fn log_request(&self, e: &crate::fetch::RequestEntry, max: usize) -> anyhow::Result<()> {
+        if max == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO requests (at, method, url, status, wait_ms, duration_ms, error) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                e.at.to_rfc3339(), e.method, e.url, e.status,
+                e.wait_ms as i64, e.duration_ms as i64, e.error
+            ],
+        )?;
+        // Ids are monotonic, so an indexed range delete bounds the table cheaply.
+        let newest = conn.last_insert_rowid();
+        conn.execute("DELETE FROM requests WHERE id <= ?1", params![newest - max as i64])?;
+        Ok(())
+    }
+
+    /// The most recent requests, newest first.
+    pub fn recent_requests(&self, limit: usize) -> anyhow::Result<Vec<RequestRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT at, method, url, status, wait_ms, duration_ms, error \
+             FROM requests ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(RequestRow {
+                at:          r.get(0)?,
+                method:      r.get(1)?,
+                url:         r.get(2)?,
+                status:      r.get::<_, Option<i64>>(3)?.map(|s| s as u16),
+                wait_ms:     r.get::<_, i64>(4)? as u64,
+                duration_ms: r.get::<_, i64>(5)? as u64,
+                error:       r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Prune snapshots older than `ttl_secs`. Returns the number removed.
     pub fn gc_snapshots(&self, ttl_secs: u64) -> anyhow::Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
@@ -538,6 +605,7 @@ impl Cache {
             searches:   count("SELECT COUNT(*) FROM searches"),
             distilled:  count("SELECT COUNT(*) FROM distillations"),
             snapshots:  count("SELECT COUNT(*) FROM snapshots"),
+            requests:   count("SELECT COUNT(*) FROM requests"),
         }
     }
 
@@ -589,6 +657,28 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Adapts the cache into the fetcher's [`RequestSink`](crate::fetch::RequestSink)
+/// seam: `fetch` stays the bottom layer and never learns about SQLite.
+pub struct CacheLog {
+    cache: std::sync::Arc<Cache>,
+    max:   usize,
+}
+
+impl CacheLog {
+    pub fn new(cache: std::sync::Arc<Cache>, max: usize) -> Self {
+        Self { cache, max }
+    }
+}
+
+impl crate::fetch::RequestSink for CacheLog {
+    fn record(&self, entry: crate::fetch::RequestEntry) {
+        // A log failure must never break a fetch.
+        if let Err(e) = self.cache.log_request(&entry, self.max) {
+            tracing::debug!("request log write failed: {e}");
+        }
+    }
 }
 
 fn parse_ts(s: &str) -> anyhow::Result<DateTime<Utc>> {
@@ -797,6 +887,40 @@ mod tests {
         c.delete_page("https://e.test/s").unwrap();
         assert!(c.get_snapshot("https://e.test/s").unwrap().is_none(), "delete cascades");
         assert_eq!(c.stats().snapshots, 0);
+    }
+
+    #[test]
+    fn request_log_records_newest_first_and_stays_bounded() {
+        use crate::fetch::RequestEntry;
+        let c = Cache::open_in_memory().unwrap();
+        let entry = |url: &str, status: Option<u16>, err: Option<&str>| RequestEntry {
+            at:          Utc::now(),
+            method:      "GET".into(),
+            url:         url.into(),
+            status,
+            wait_ms:     120,
+            duration_ms: 45,
+            error:       err.map(str::to_string),
+        };
+        for i in 0..10 {
+            c.log_request(&entry(&format!("https://e.test/{i}"), Some(200), None), 5).unwrap();
+        }
+        let rows = c.recent_requests(10).unwrap();
+        assert_eq!(rows.len(), 5, "bounded to the newest 5");
+        assert_eq!(rows[0].url, "https://e.test/9", "newest first");
+        assert_eq!(rows[0].wait_ms, 120, "politeness wait recorded");
+        assert_eq!(c.stats().requests, 5);
+
+        // A refusal is part of the trail.
+        c.log_request(&entry("https://e.test/blocked", None, Some("blocked by robots.txt")), 5).unwrap();
+        let rows = c.recent_requests(1).unwrap();
+        assert!(rows[0].status.is_none());
+        assert_eq!(rows[0].error.as_deref(), Some("blocked by robots.txt"));
+
+        // max = 0 disables the log entirely.
+        let c2 = Cache::open_in_memory().unwrap();
+        c2.log_request(&entry("https://e.test/x", Some(200), None), 0).unwrap();
+        assert_eq!(c2.stats().requests, 0);
     }
 
     #[test]

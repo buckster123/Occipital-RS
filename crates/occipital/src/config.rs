@@ -36,6 +36,12 @@ pub const DEFAULT_GC_MIN_AGE_SECS: u64 = 86_400; // never GC a page fetched < 1 
 // by design — snapshots are not knowledge and never recalled.
 pub const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 3_600; // 1 hour
 
+// Multi-step politeness hygiene (Phase 16): a long-running node re-checks
+// robots.txt rather than trusting a process-lifetime copy, and keeps a bounded
+// trail of what it actually sent.
+pub const DEFAULT_ROBOTS_TTL_SECS: u64 = 3_600; // re-read robots.txt hourly
+pub const DEFAULT_LOG_MAX: usize = 500; // request-log rows retained
+
 // Compile-time guard: a conservative posture is the whole point — a careless
 // edit that makes the crawler aggressive must fail the build, not just a test.
 const _: () = assert!(DEFAULT_RATE_PER_DOMAIN <= 1.0, "default ≤ 1 req/s per domain");
@@ -74,6 +80,10 @@ pub struct Config {
     pub gc_min_salience:    f32,
     pub gc_min_age_secs:    u64,
     pub snapshot_ttl_secs:  u64,
+    /// How long a cached robots.txt stays authoritative.
+    pub robots_ttl_secs:    u64,
+    /// Request-log rows retained (0 disables the log).
+    pub log_max:            usize,
     /// Opt-in persistent cookie jar (sessions & identity — see `session`).
     pub cookies_enabled:    bool,
     pub cookies_file:       PathBuf,
@@ -110,6 +120,8 @@ impl Config {
             gc_min_salience:    env_parse("OCCIPITAL_GC_MIN_SALIENCE", DEFAULT_GC_MIN_SALIENCE),
             gc_min_age_secs:    env_parse("OCCIPITAL_GC_MIN_AGE_SECS", DEFAULT_GC_MIN_AGE_SECS),
             snapshot_ttl_secs:  env_parse("OCCIPITAL_SNAPSHOT_TTL_SECS", DEFAULT_SNAPSHOT_TTL_SECS),
+            robots_ttl_secs:    env_parse("OCCIPITAL_ROBOTS_TTL_SECS", DEFAULT_ROBOTS_TTL_SECS),
+            log_max:            env_parse("OCCIPITAL_LOG_MAX", DEFAULT_LOG_MAX),
             cookies_enabled:    env_bool("OCCIPITAL_COOKIES", false),
             cookies_file:       cookies_file(),
             headers_file:       env::var("OCCIPITAL_HEADERS_FILE").ok()
@@ -196,6 +208,8 @@ mod tests {
             gc_min_salience:    DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs:    DEFAULT_GC_MIN_AGE_SECS,
             snapshot_ttl_secs:  DEFAULT_SNAPSHOT_TTL_SECS,
+            robots_ttl_secs:    DEFAULT_ROBOTS_TTL_SECS,
+            log_max:            DEFAULT_LOG_MAX,
             cookies_enabled:    false,
             cookies_file:       PathBuf::from("/tmp/cookies.json"),
             headers_file:       None,

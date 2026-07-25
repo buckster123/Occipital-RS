@@ -134,11 +134,10 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.
 
-Planned (agent-browsing expansion, Phase 16 — design locked in docs/agent-browsing.md;
-Phases 12–15 shipped: the page model, the interaction verbs, SPA salvage, and sessions &
-identity): multi-step politeness hygiene (honor `Crawl-delay`, eTLD+1 rate buckets, robots
-cache TTL, request log, `--obey-robots` alias). No JS engine — ever in-core; a render
-*sidecar* is a documented door, not a phase.
+The **agent-browsing expansion (Phases 12–16) is complete** — page model, interaction verbs,
+SPA salvage, sessions & identity, and multi-step politeness hygiene; see
+docs/agent-browsing.md. No JS engine — ever in-core; a render *sidecar* (`occipital-render`,
+CDP-as-client) remains a documented door, not a scheduled phase.
 
 ---
 
@@ -149,7 +148,9 @@ cache TTL, request log, `--obey-robots` alias). No JS engine — ever in-core; a
 | `OCCIPITAL_DB` | `~/.local/share/occipital/occipital.db` | SQLite path |
 | `OCCIPITAL_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | `""` → FTS5-only (Nano) |
 | `OCCIPITAL_USER_AGENT` | `Occipital/<ver> (+repo; ApexOS web reader)` | honest, identifiable UA |
-| `OCCIPITAL_RESPECT_ROBOTS` | `1` | honor robots.txt (per-domain, cached) |
+| `OCCIPITAL_RESPECT_ROBOTS` | `1` | honor robots.txt (per-origin, cached; CLI `--obey-robots`) |
+| `OCCIPITAL_ROBOTS_TTL_SECS` | `3600` | how long a cached robots.txt stays authoritative |
+| `OCCIPITAL_LOG_MAX` | `500` | request-log rows retained (`0` disables); `occipital log` / `GET /log` |
 | `OCCIPITAL_RATE_PER_DOMAIN` | `0.5` | requests/sec per domain (token bucket + jitter) |
 | `OCCIPITAL_MAX_CONCURRENCY` | `4` | global in-flight fetch cap |
 | `OCCIPITAL_FRESH_TTL_SECS` | `86400` | default cache freshness window |

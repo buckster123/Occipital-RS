@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/distill", post(distill))
         .route("/save", post(save))
         .route("/forget", delete(forget))
+        .route("/log", get(request_log))
         .route("/gc", post(gc))
         .route("/keys", get(keys_list))
         .route("/keys/:provider", put(keys_set).delete(keys_rm))
@@ -237,6 +238,17 @@ async fn save(State(s): State<AppState>, Query(q): Query<UrlQ>) -> ApiResult {
 async fn forget(State(s): State<AppState>, Query(q): Query<UrlQ>) -> ApiResult {
     let removed = s.engine.forget(&q.url)?;
     Ok(Json(json!({ "status": "ok", "url": q.url, "removed": removed })))
+}
+
+#[derive(Deserialize)]
+struct LogQ {
+    limit: Option<usize>,
+}
+
+/// `GET /log` — the recent request trail (newest first).
+async fn request_log(State(s): State<AppState>, Query(q): Query<LogQ>) -> ApiResult {
+    let rows = s.engine.log(q.limit.unwrap_or(20))?;
+    Ok(Json(json!({ "kind": "log", "count": rows.len(), "requests": rows })))
 }
 
 async fn gc(State(s): State<AppState>) -> ApiResult {

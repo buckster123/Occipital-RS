@@ -19,9 +19,12 @@ above it can bypass it (the only network door).
 4. **Honest user-agent.** `OCCIPITAL_USER_AGENT` defaults to
    `Occipital/<ver> (+https://github.com/buckster123/Occipital-RS; ApexOS web reader)` — it says
    what it is and how to contact. Configurable, never randomized per-request.
-5. **robots.txt awareness.** `OCCIPITAL_RESPECT_ROBOTS = 1` (default): fetch + cache each
-   domain's robots.txt, honor `Disallow` + `Crawl-delay` (raises that domain's min interval).
-   A disallowed URL returns a clean "blocked by robots" note, not an error.
+5. **robots.txt awareness.** `OCCIPITAL_RESPECT_ROBOTS = 1` (default, CLI `--obey-robots`):
+   fetch + cache each **origin's** robots.txt (scheme + host + port), honor `Disallow` +
+   `Crawl-delay` (raises that domain's min interval, clamped at 60s and logged when clamped).
+   The cache re-checks every `OCCIPITAL_ROBOTS_TTL_SECS` so a long-running node notices a
+   policy change. A disallowed URL returns a clean "blocked by robots" refusal — and the
+   refusal is recorded in the request log.
 6. **Backoff that listens.** On `429`/`503`, honor `Retry-After` if present, else exponential
    backoff (base 2s, cap 60s, ±jitter). Repeated 429s raise that domain's interval for the
    session (adaptive politeness).
@@ -35,6 +38,10 @@ above it can bypass it (the only network door).
    — never from extraction, cache refresh, or retry logic. It is **never replayed
    automatically** (not idempotent: a 429/503/transport error returns honestly instead), its
    result page is never cached, and it rides the same robots gate + rate budget as every read.
+10. **An honest trail.** Every attempt — method, URL, status, politeness wait, duration, and
+    any refusal — lands in a bounded request log (`occipital log`, `GET /log`,
+    `OCCIPITAL_LOG_MAX` rows). We *are* the network stack, so observability is a feature, not
+    an add-on: an operator can always see exactly what their node sent and what it cost.
 
 ## What we deliberately do NOT do
 
@@ -78,6 +85,8 @@ agent is a *worse* agent — good citizenship is self-interest.
 | `OCCIPITAL_COOKIES_FILE` | `<data_dir>/occipital/cookies.json` | persisted jar (`0600`) |
 | `OCCIPITAL_HEADERS_FILE` | unset | per-domain extra headers (UA not overridable) |
 | `OCCIPITAL_PROXY` | unset | explicit proxy — topology, never rotation |
+| `OCCIPITAL_ROBOTS_TTL_SECS` | `3600` | how long a cached robots.txt stays authoritative |
+| `OCCIPITAL_LOG_MAX` | `500` | request-log rows retained (`0` disables the log) |
 
 ## Testing politeness
 

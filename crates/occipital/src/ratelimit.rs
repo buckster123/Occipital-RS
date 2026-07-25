@@ -8,6 +8,11 @@
 //! **Jitter is additive-only** — `interval + rand(0..jitter·interval)`, never
 //! `±`. This breaks the metronome pattern (the #1 bot tell) while guaranteeing
 //! the spacing is *always ≥ interval*: politeness is a floor, not an average.
+//!
+//! Buckets are keyed by **registrable domain** (Phase 16), so hopping between
+//! `www.`/`api.`/`cdn.` subdomains shares one site budget instead of opening a
+//! fresh one per hostname. A site's `Crawl-delay` can *raise* its bucket's
+//! interval (never lower it) via [`DomainLimiter::set_min_interval`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,6 +25,8 @@ pub struct DomainLimiter {
     jitter_frac: f64,
     /// domain key → earliest `Instant` the next request to it may be scheduled.
     next_allowed: Mutex<HashMap<String, Instant>>,
+    /// domain key → a *raised* interval (robots `Crawl-delay`).
+    overrides:    Mutex<HashMap<String, Duration>>,
 }
 
 impl DomainLimiter {
@@ -35,36 +42,117 @@ impl DomainLimiter {
             interval,
             jitter_frac: jitter_frac.max(0.0),
             next_allowed: Mutex::new(HashMap::new()),
+            overrides: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Block until it is polite to hit `key` again, reserving this request's slot.
-    pub async fn throttle(&self, key: &str) {
-        if self.interval.is_zero() {
-            return;
+    /// Raise `key`'s minimum interval (a site's `Crawl-delay`). Politeness only
+    /// ratchets **up**: a shorter request than our configured pace is ignored,
+    /// and an existing longer override is kept. Returns `true` if it applied.
+    pub fn set_min_interval(&self, key: &str, interval: Duration) -> bool {
+        let previous = self.interval_for(key);
+        if interval <= previous {
+            return false;
+        }
+        self.overrides.lock().unwrap().insert(key.to_string(), interval);
+        // A slot already reserved under the *shorter* interval would let the
+        // very next request land before the site's requested spacing — push it
+        // out by the difference. (Learning a Crawl-delay from robots.txt always
+        // happens right after a request to that same domain.)
+        let mut map = self.next_allowed.lock().unwrap();
+        if let Some(next) = map.get(key).copied() {
+            map.insert(key.to_string(), next + (interval - previous));
+        }
+        true
+    }
+
+    /// The effective interval for a key: the configured pace, or a larger
+    /// site-requested one.
+    fn interval_for(&self, key: &str) -> Duration {
+        let base = self.interval;
+        match self.overrides.lock().unwrap().get(key) {
+            Some(d) if *d > base => *d,
+            _ => base,
+        }
+    }
+
+    /// Block until it is polite to hit `key` again, reserving this request's
+    /// slot. Returns how long the caller waited (for the request log).
+    pub async fn throttle(&self, key: &str) -> Duration {
+        let interval = self.interval_for(key);
+        if interval.is_zero() {
+            return Duration::ZERO;
         }
         let wait = {
             // Short, await-free critical section (std Mutex is correct here).
             let mut map = self.next_allowed.lock().unwrap();
             let now = Instant::now();
             let (scheduled, wait) = schedule(map.get(key).copied(), now);
-            let jitter = self.jitter(); // sync; rng dropped before any await
+            let jitter = self.jitter(interval); // sync; rng dropped before any await
             let scheduled = scheduled + jitter;
-            map.insert(key.to_string(), scheduled + self.interval);
+            map.insert(key.to_string(), scheduled + interval);
             wait + jitter
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
+        wait
     }
 
-    fn jitter(&self) -> Duration {
+    fn jitter(&self, interval: Duration) -> Duration {
         if self.jitter_frac <= 0.0 {
             return Duration::ZERO;
         }
         let f: f64 = rand::thread_rng().gen::<f64>() * self.jitter_frac;
-        self.interval.mul_f64(f)
+        interval.mul_f64(f)
     }
+}
+
+/// Multi-label public suffixes we recognize when deriving a registrable domain.
+///
+/// This is a curated list, not the full Public Suffix List — deliberately: the
+/// PSL is ~10k entries of build weight for a Nano-first binary, and **every
+/// error here lands on the polite side**. An unknown multi-label suffix makes
+/// the bucket *wider* (more requests share one budget → we go slower); it can
+/// never split one site into several buckets and hammer it. Shared-hosting
+/// suffixes (`github.io`, `pages.dev`, …) are listed so distinct tenants get
+/// their own budget rather than queueing behind each other.
+const MULTI_LABEL_SUFFIXES: &[&str] = &[
+    // ccTLD second levels
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "sch.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "co.kr", "or.kr", "co.za", "org.za", "co.il", "co.th", "in.th",
+    "co.id", "or.id", "co.in", "net.in", "org.in", "gov.in", "ac.in",
+    "com.br", "net.br", "org.br", "gov.br", "com.ar", "com.mx", "com.co",
+    "com.pe", "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+    "com.hk", "com.sg", "com.my", "com.ph", "com.vn", "com.tw", "com.tr",
+    "com.pk", "com.ua", "com.pl", "com.ru", "com.es", "com.pt", "com.gr",
+    // shared hosting / platform suffixes (distinct tenants = distinct budgets)
+    "github.io", "gitlab.io", "pages.dev", "workers.dev", "vercel.app",
+    "netlify.app", "herokuapp.com", "appspot.com", "azurewebsites.net",
+    "blogspot.com", "wordpress.com", "readthedocs.io", "sourceforge.net",
+];
+
+/// The rate-limit bucket key for a host: its registrable domain (eTLD+1), so
+/// `www.example.com` and `api.example.com` share one site budget. IP literals
+/// bucket as themselves.
+pub fn registrable_domain(host: &str) -> String {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 2 {
+        return host;
+    }
+    let n = labels.len();
+    let last_two = format!("{}.{}", labels[n - 2], labels[n - 1]);
+    if MULTI_LABEL_SUFFIXES.contains(&last_two.as_str()) {
+        return format!("{}.{}", labels[n - 3], last_two);
+    }
+    last_two
 }
 
 /// Pure scheduling math (no clock, no I/O): given the earliest-next-allowed time
@@ -147,6 +235,66 @@ mod tests {
             let gap = w[1].duration_since(w[0]);
             assert!(gap >= Duration::from_millis(45), "jitter must add, never subtract: {gap:?}");
         }
+    }
+
+    #[test]
+    fn registrable_domain_groups_subdomains_and_respects_known_suffixes() {
+        assert_eq!(registrable_domain("www.example.com"), "example.com");
+        assert_eq!(registrable_domain("api.cdn.example.com"), "example.com");
+        assert_eq!(registrable_domain("Example.COM."), "example.com", "normalized");
+        assert_eq!(registrable_domain("example.com"), "example.com");
+        assert_eq!(registrable_domain("localhost"), "localhost");
+        // Multi-label suffixes: news.bbc.co.uk must NOT collapse to "co.uk".
+        assert_eq!(registrable_domain("news.bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(registrable_domain("bbc.co.uk"), "bbc.co.uk");
+        // Shared hosting: distinct tenants get distinct budgets.
+        assert_eq!(registrable_domain("someone.github.io"), "someone.github.io");
+        // IP literals bucket as themselves.
+        assert_eq!(registrable_domain("127.0.0.1"), "127.0.0.1");
+        assert_eq!(registrable_domain("[::1]"), "[::1]");
+    }
+
+    #[tokio::test]
+    async fn crawl_delay_raises_the_interval_but_never_lowers_it() {
+        // Configured pace: 20 req/s (50ms). A site asking for 200ms wins.
+        let lim = DomainLimiter::new(20.0, 0.0);
+        assert!(lim.set_min_interval("slow.test", Duration::from_millis(200)));
+        assert!(!lim.set_min_interval("slow.test", Duration::from_millis(100)),
+                "a shorter request never loosens an existing override");
+        assert!(!lim.set_min_interval("fast.test", Duration::from_millis(10)),
+                "a site asking to be hit faster than our pace is ignored");
+
+        let start = Instant::now();
+        lim.throttle("slow.test").await;
+        lim.throttle("slow.test").await;
+        assert!(start.elapsed() >= Duration::from_millis(190), "crawl-delay honored: {:?}", start.elapsed());
+
+        // The real sequence: a request goes out (reserving a slot at the old
+        // pace), *then* robots.txt reveals the Crawl-delay. The already-reserved
+        // slot must be pushed out, or the next request lands too early.
+        let lim = DomainLimiter::new(20.0, 0.0); // 50ms
+        lim.throttle("late.test").await; // slot reserved at +50ms
+        assert!(lim.set_min_interval("late.test", Duration::from_millis(300)));
+        let start = Instant::now();
+        lim.throttle("late.test").await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(280),
+            "a slot reserved before the delay was known must be pushed out, waited {:?}",
+            start.elapsed()
+        );
+
+        let start = Instant::now();
+        lim.throttle("fast.test").await;
+        lim.throttle("fast.test").await;
+        assert!(start.elapsed() < Duration::from_millis(150), "unaffected domain keeps our pace");
+    }
+
+    #[tokio::test]
+    async fn throttle_reports_the_wait_it_imposed() {
+        let lim = DomainLimiter::new(10.0, 0.0); // 100ms
+        assert_eq!(lim.throttle("x.test").await, Duration::ZERO, "first request is free");
+        let waited = lim.throttle("x.test").await;
+        assert!(waited >= Duration::from_millis(90), "second waited ~100ms, reported {waited:?}");
     }
 
     #[tokio::test]
