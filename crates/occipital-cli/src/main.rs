@@ -22,6 +22,18 @@ enum Command {
     Fetch { url: String },
     /// Show a page's element registry — links + forms with stable ordinals.
     Dom { url: String },
+    /// Click an element by registry ordinal: link:N follows it, form:N submits it.
+    Click { url: String, element: String },
+    /// Fill and submit a form by registry ordinal.
+    Submit {
+        url: String,
+        /// The form's 1-based ordinal (see `occipital dom`).
+        #[arg(long)]
+        form: usize,
+        /// Field override as name=value (repeatable).
+        #[arg(long = "field", value_parser = parse_field)]
+        fields: Vec<(String, String)>,
+    },
     /// Recall from already-read (cached) pages only.
     Recall { query: String },
     /// Distill cached pages into curated knowledge (summary/points/entities/tags).
@@ -41,6 +53,13 @@ enum Command {
     },
     /// Show config + tier + cache stats.
     Status,
+}
+
+/// `--field name=value` parser.
+fn parse_field(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+        .ok_or_else(|| format!("expected name=value, got {s:?}"))
 }
 
 #[derive(Subcommand)]
@@ -99,6 +118,33 @@ async fn main() -> anyhow::Result<()> {
                     println!("  #{} {} — {}", l.idx, l.text, l.url);
                 }
             }
+        }
+        Command::Click { url, element } => {
+            let engine = Engine::from_config(&config)?;
+            let r = engine.click(&url, &element).await?;
+            eprintln!("[{} → {}]", r.element, r.target_url);
+            if let Some(s) = r.status {
+                eprintln!("[status {s}]");
+            }
+            if r.from_cache {
+                eprintln!("[served from cache]");
+            }
+            println!("{}", r.page.markdown);
+        }
+        Command::Submit { url, form, fields } => {
+            let engine = Engine::from_config(&config)?;
+            let r = engine.submit(&url, form, &fields).await?;
+            let sent = r.sent.iter()
+                .map(|f| format!("{}={}", f.name, f.value))
+                .collect::<Vec<_>>().join(" ");
+            eprintln!("[form#{} {} {} — {}]", r.form, r.method.to_uppercase(), r.action, sent);
+            if let Some(s) = r.status {
+                eprintln!("[status {s}]");
+            }
+            if r.cached {
+                eprintln!("[served from cache]");
+            }
+            println!("{}", r.page.markdown);
         }
         Command::Recall { query } => {
             let engine = Engine::from_config(&config)?;

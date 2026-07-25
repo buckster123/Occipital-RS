@@ -18,7 +18,7 @@ use crate::curate::{make_auto_distiller, make_distiller, Distiller};
 use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
 use crate::extract::{extract_bytes, Form, Page};
-use crate::fetch::{Fetcher, PoliteFetcher};
+use crate::fetch::{Fetcher, HttpRequest, PoliteFetcher};
 use crate::keys::Keys;
 use crate::providers::{provider_for, SearchProvider, SearchResult};
 
@@ -93,6 +93,74 @@ pub struct DomView {
     pub content_hash: String,
     pub from_cache:   bool,
     pub snapshot:     bool,
+}
+
+/// What an element selector (`web_click`) addresses: `link:N` or `form:N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementSel {
+    Link(usize),
+    Form(usize),
+}
+
+/// Parse the click micro-grammar: `link:3` / `form:1` (1-based ordinals from
+/// the element registry).
+fn parse_element(s: &str) -> anyhow::Result<ElementSel> {
+    let t = s.trim().to_ascii_lowercase();
+    let (kind, n) = t
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("element must be link:N or form:N (got {s:?})"))?;
+    let idx: usize = n
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("element ordinal must be a number (got {s:?})"))?;
+    if idx == 0 {
+        anyhow::bail!("element ordinals are 1-based (got {s:?})");
+    }
+    match kind.trim() {
+        "link" => Ok(ElementSel::Link(idx)),
+        "form" => Ok(ElementSel::Form(idx)),
+        other => anyhow::bail!("unknown element kind {other:?} — use link:N or form:N"),
+    }
+}
+
+/// One field as actually submitted (`password` values redacted for the report;
+/// the wire carries the real value).
+#[derive(Debug, Clone, Serialize)]
+pub struct SentField {
+    pub name:  String,
+    pub value: String,
+}
+
+/// The outcome of `web_click`: the element resolved, the navigation made, and
+/// the resulting reader-mode page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClickReport {
+    pub source_url: String,
+    pub element:    String,
+    /// The link href followed, or the clicked form's action.
+    pub target_url: String,
+    pub page:       Page,
+    pub from_cache: bool,
+    /// HTTP status of a POST-form click (`None` for the read-through paths,
+    /// where status is absorbed by the fetch pipeline).
+    pub status:     Option<u16>,
+}
+
+/// The outcome of `web_submit`: what was sent, where, and the resulting page.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitReport {
+    pub source_url: String,
+    pub form:       usize,
+    pub action:     String,
+    pub method:     String,
+    pub sent:       Vec<SentField>,
+    /// HTTP status of a live POST (`None` on the GET path — served through the
+    /// normal read-through pipeline).
+    pub status:     Option<u16>,
+    pub page:       Page,
+    /// GET results cache like any page; a POST result is **never** cached (the
+    /// URL alone cannot reproduce it).
+    pub cached:     bool,
 }
 
 pub struct Engine {
@@ -331,6 +399,143 @@ impl Engine {
             from_cache,
             snapshot,
         })
+    }
+
+    /// Click an element on a page by its registry ordinal (`link:N` / `form:N`).
+    /// A link click is a polite GET of its href through the normal read-through
+    /// pipeline; a form click submits that form with its current values (see
+    /// [`submit`](Self::submit)). The source page resolves cache-first
+    /// (fetch-if-uncached), same as `web_dom`.
+    pub async fn click(&self, url: &str, element: &str) -> anyhow::Result<ClickReport> {
+        match parse_element(element)? {
+            ElementSel::Link(n) => {
+                let (page, _) = self.fetch(url, false).await?;
+                let link = page.links.get(n - 1).ok_or_else(|| {
+                    anyhow::anyhow!("no link #{n} on {} ({} links in the registry — see web_dom)", page.url, page.links.len())
+                })?;
+                let (target, from_cache) = self.fetch(&link.url, false).await?;
+                Ok(ClickReport {
+                    source_url: page.url.clone(),
+                    element: element.trim().to_string(),
+                    target_url: link.url.clone(),
+                    page: target,
+                    from_cache,
+                    status: None,
+                })
+            }
+            ElementSel::Form(n) => {
+                let report = self.submit(url, n, &[]).await?;
+                Ok(ClickReport {
+                    source_url: report.source_url,
+                    element: element.trim().to_string(),
+                    target_url: report.action,
+                    page: report.page,
+                    from_cache: report.cached,
+                    status: report.status,
+                })
+            }
+        }
+    }
+
+    /// Fill and submit a form by its registry ordinal. `overrides` set named
+    /// fields; everything else keeps its current value (hidden state verbatim,
+    /// exactly as the site sent it). GET submits through the read-through
+    /// pipeline (a repeated identical submission is a cache hit — zero live
+    /// requests); POST goes live once, is **never auto-retried**, and its
+    /// result is never cached. Politeness gates (robots, rate, concurrency)
+    /// apply to both.
+    pub async fn submit(
+        &self,
+        url: &str,
+        form_idx: usize,
+        overrides: &[(String, String)],
+    ) -> anyhow::Result<SubmitReport> {
+        let (page, _) = self.fetch(url, false).await?;
+        let form = page.forms.iter().find(|f| f.idx == form_idx).ok_or_else(|| {
+            anyhow::anyhow!("no form #{form_idx} on {} ({} forms in the registry — see web_dom)", page.url, page.forms.len())
+        })?;
+
+        // An override naming a field the form doesn't have is almost certainly
+        // a typo — refuse rather than silently misfire.
+        for (name, _) in overrides {
+            if !form.fields.iter().any(|f| &f.name == name) {
+                let known: Vec<&str> = form.fields.iter()
+                    .filter(|f| !f.name.is_empty()).map(|f| f.name.as_str()).collect();
+                anyhow::bail!("form #{form_idx} has no field named {name:?} (fields: {known:?})");
+            }
+        }
+
+        // Effective pairs, in the form's own field order: override > current
+        // value > empty. An overridden name is sent once (radio groups repeat
+        // names in the registry).
+        let override_of = |name: &str| {
+            overrides.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+        let mut sent_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut redact: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for f in form.fields.iter().filter(|f| !f.name.is_empty()) {
+            if f.kind == "password" {
+                redact.insert(f.name.clone());
+            }
+            match override_of(&f.name) {
+                Some(v) => {
+                    if sent_names.insert(f.name.clone()) {
+                        pairs.push((f.name.clone(), v));
+                    }
+                }
+                None => pairs.push((f.name.clone(), f.value.clone().unwrap_or_default())),
+            }
+        }
+
+        let sent: Vec<SentField> = pairs
+            .iter()
+            .map(|(n, v)| SentField {
+                name:  n.clone(),
+                value: if redact.contains(n) { "•••".to_string() } else { v.clone() },
+            })
+            .collect();
+
+        let (action, method) = (form.action.clone(), form.method.clone());
+        if method == "post" {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .finish();
+            let resp = self.fetcher.request(HttpRequest::post_form(&action, body.into_bytes())).await?;
+            let result = extract_bytes(&resp.body, &resp.final_url);
+            Ok(SubmitReport {
+                source_url: page.url,
+                form: form_idx,
+                action,
+                method,
+                sent,
+                status: Some(resp.status),
+                page: result,
+                cached: false,
+            })
+        } else {
+            // Per the HTML spec a GET submission replaces the action's query
+            // string with the form data.
+            let mut u = url::Url::parse(&action)?;
+            if pairs.is_empty() {
+                u.set_query(None);
+            } else {
+                u.query_pairs_mut()
+                    .clear()
+                    .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            }
+            let (result, from_cache) = self.fetch(u.as_str(), false).await?;
+            Ok(SubmitReport {
+                source_url: page.url,
+                form: form_idx,
+                action,
+                method,
+                sent,
+                status: None,
+                page: result,
+                cached: from_cache,
+            })
+        }
     }
 
     /// Whether a snapshot exists for `url` and is inside the snapshot TTL.
@@ -721,6 +926,169 @@ mod tests {
         assert!(!c1 && c2, "first live, second cached");
         assert_eq!(r1, r2);
         assert_eq!(f.calls(), 1, "the re-asked search hit zero live requests");
+    }
+
+    // ---- click + submit (Phase 13) ---------------------------------------
+
+    /// Records every GET url and every general request — the wire-level
+    /// assertions for the interaction verbs.
+    struct Recording {
+        body: Vec<u8>,
+        gets: std::sync::Mutex<Vec<String>>,
+        reqs: std::sync::Mutex<Vec<HttpRequest>>,
+    }
+    impl Recording {
+        fn new(body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                body: body.as_bytes().to_vec(),
+                gets: std::sync::Mutex::new(Vec::new()),
+                reqs: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn gets(&self) -> Vec<String> {
+            self.gets.lock().unwrap().clone()
+        }
+        fn reqs(&self) -> Vec<HttpRequest> {
+            self.reqs.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl Fetcher for Recording {
+        async fn get(&self, url: &str) -> anyhow::Result<FetchResponse> {
+            self.gets.lock().unwrap().push(url.to_string());
+            Ok(FetchResponse {
+                final_url: url.to_string(), status: 200, content_type: None,
+                etag: None, last_modified: None, body: self.body.clone(),
+                source: Source::Network,
+            })
+        }
+        async fn request(&self, req: HttpRequest) -> anyhow::Result<FetchResponse> {
+            let url = req.url.clone();
+            self.reqs.lock().unwrap().push(req);
+            Ok(FetchResponse {
+                final_url: url, status: 200, content_type: None,
+                etag: None, last_modified: None, body: self.body.clone(),
+                source: Source::Network,
+            })
+        }
+    }
+
+    const SUBMIT_HTML: &str = r#"<html><head><title>F</title></head><body><main>
+        <p><a href="/a">first</a> <a href="/b">second</a></p>
+        <form action="/search?stale=1">
+          <input type="text" name="q" value="">
+          <button>Find</button>
+        </form>
+        <form action="/login" method="post">
+          <input type="hidden" name="csrf" value="tok123">
+          <input type="text" name="user" value="andre">
+          <input type="password" name="pw">
+          <button>Sign in</button>
+        </form>
+        </main></body></html>"#;
+
+    #[test]
+    fn element_selector_grammar_parses_and_rejects() {
+        assert_eq!(parse_element("link:3").unwrap(), ElementSel::Link(3));
+        assert_eq!(parse_element(" Form:1 ").unwrap(), ElementSel::Form(1));
+        assert!(parse_element("button:1").is_err(), "unknown kind");
+        assert!(parse_element("link:0").is_err(), "ordinals are 1-based");
+        assert!(parse_element("link").is_err(), "missing ordinal");
+        assert!(parse_element("link:x").is_err(), "non-numeric ordinal");
+    }
+
+    #[tokio::test]
+    async fn click_link_by_ordinal_navigates_politely() {
+        let f = Recording::new(SUBMIT_HTML);
+        let e = engine(f.clone(), 3600);
+        let report = e.click("https://e.test/f", "link:2").await.unwrap();
+        assert_eq!(report.target_url, "https://e.test/b");
+        assert_eq!(report.source_url, "https://e.test/f");
+        assert_eq!(f.gets(), vec!["https://e.test/f", "https://e.test/b"], "source + one polite GET");
+
+        let err = e.click("https://e.test/f", "link:9").await.unwrap_err().to_string();
+        assert!(err.contains("no link #9"), "got: {err}");
+        assert!(err.contains("2 links"), "tells the agent the registry size: {err}");
+    }
+
+    #[tokio::test]
+    async fn submit_get_replaces_the_query_and_reuses_the_cache() {
+        let f = Recording::new(SUBMIT_HTML);
+        let e = engine(f.clone(), 3600);
+        let report = e
+            .submit("https://e.test/f", 1, &[("q".into(), "hello world".into())])
+            .await
+            .unwrap();
+        assert_eq!(report.method, "get");
+        assert!(!report.cached);
+        assert_eq!(
+            f.gets()[1],
+            "https://e.test/search?q=hello+world",
+            "form data replaces the stale action query"
+        );
+
+        // The same ask again: source page AND result are cache hits — the
+        // repeated identical submission costs zero live requests.
+        let report = e
+            .submit("https://e.test/f", 1, &[("q".into(), "hello world".into())])
+            .await
+            .unwrap();
+        assert!(report.cached);
+        assert_eq!(f.gets().len(), 2, "no new live requests");
+    }
+
+    #[tokio::test]
+    async fn submit_post_sends_urlencoded_once_and_never_caches_the_result() {
+        let f = Recording::new(SUBMIT_HTML);
+        let e = engine(f.clone(), 3600);
+        let report = e
+            .submit("https://e.test/f", 2, &[("pw".into(), "s3cret".into())])
+            .await
+            .unwrap();
+        assert_eq!(report.method, "post");
+        assert_eq!(report.status, Some(200));
+        assert!(!report.cached);
+
+        let reqs = f.reqs();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].url, "https://e.test/login");
+        assert_eq!(reqs[0].headers[0].1, "application/x-www-form-urlencoded");
+        assert!(reqs[0].robots, "form POST is robots-gated");
+        let body = String::from_utf8(reqs[0].body.clone().unwrap()).unwrap();
+        assert_eq!(body, "csrf=tok123&user=andre&pw=s3cret", "hidden state verbatim, field order kept");
+
+        // Only the source page is in the cache — the POST result never lands.
+        assert_eq!(e.stats().unwrap().pages, 1);
+
+        // The report redacts the password; the wire carried the real value.
+        let pw = report.sent.iter().find(|s| s.name == "pw").unwrap();
+        assert_eq!(pw.value, "•••");
+        assert!(body.contains("pw=s3cret"));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_an_unknown_field_name() {
+        let f = Recording::new(SUBMIT_HTML);
+        let e = engine(f.clone(), 3600);
+        let err = e
+            .submit("https://e.test/f", 1, &[("qq".into(), "typo".into())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no field named \"qq\""), "got: {err}");
+        assert!(err.contains("\"q\""), "lists the real fields: {err}");
+        assert!(f.reqs().is_empty() && f.gets().len() == 1, "nothing was submitted");
+    }
+
+    #[tokio::test]
+    async fn clicking_a_form_submits_it_with_current_values() {
+        let f = Recording::new(SUBMIT_HTML);
+        let e = engine(f.clone(), 3600);
+        let report = e.click("https://e.test/f", "form:2").await.unwrap();
+        assert_eq!(report.target_url, "https://e.test/login");
+        assert_eq!(report.status, Some(200));
+        let body = String::from_utf8(f.reqs()[0].body.clone().unwrap()).unwrap();
+        assert_eq!(body, "csrf=tok123&user=andre&pw=", "current values, hidden verbatim");
     }
 
     // ---- dom + snapshots (Phase 12) --------------------------------------

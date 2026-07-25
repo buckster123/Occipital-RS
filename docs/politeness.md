@@ -31,6 +31,10 @@ above it can bypass it (the only network door).
 8. **Caps on appetite.** Per-`web_search`, fetch at most `top_n` results (default 5); per-page
    body size cap (default 2 MB, truncate with a note); total per-turn fetch budget so one task
    can't crawl the web.
+9. **Deliberate writes only.** A POST happens solely from an explicit `web_submit`/`web_click`
+   — never from extraction, cache refresh, or retry logic. It is **never replayed
+   automatically** (not idempotent: a 429/503/transport error returns honestly instead), its
+   result page is never cached, and it rides the same robots gate + rate budget as every read.
 
 ## What we deliberately do NOT do
 

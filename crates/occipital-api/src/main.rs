@@ -64,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/search", get(search))
         .route("/fetch", get(fetch))
         .route("/dom", get(dom))
+        .route("/click", post(click))
+        .route("/submit", post(submit))
         .route("/recall", get(recall))
         .route("/distill", post(distill))
         .route("/save", post(save))
@@ -150,6 +152,43 @@ async fn dom(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult {
         "kind": "dom", "url": view.url, "title": view.title, "links": view.links,
         "forms": view.forms, "content_hash": view.content_hash,
         "from_cache": view.from_cache, "snapshot": view.snapshot,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ClickBody {
+    url:     String,
+    element: String,
+}
+
+/// `POST /click` — follow a link / submit a form by registry ordinal.
+async fn click(State(s): State<AppState>, Json(b): Json<ClickBody>) -> ApiResult {
+    let r = s.engine.click(&b.url, &b.element).await?;
+    Ok(Json(json!({
+        "kind": "click", "element": r.element, "source_url": r.source_url,
+        "target_url": r.target_url, "url": r.page.url, "title": r.page.title,
+        "markdown": r.page.markdown, "links": r.page.links, "forms": r.page.forms,
+        "content_hash": r.page.content_hash, "from_cache": r.from_cache, "status": r.status,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SubmitBody {
+    url:  String,
+    form: usize,
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /submit` — fill + submit a form by registry ordinal.
+async fn submit(State(s): State<AppState>, Json(b): Json<SubmitBody>) -> ApiResult {
+    let fields: Vec<(String, String)> = b.fields.into_iter().collect();
+    let r = s.engine.submit(&b.url, b.form, &fields).await?;
+    Ok(Json(json!({
+        "kind": "submit", "source_url": r.source_url, "form": r.form, "action": r.action,
+        "method": r.method, "sent": r.sent, "status": r.status, "url": r.page.url,
+        "title": r.page.title, "markdown": r.page.markdown, "links": r.page.links,
+        "forms": r.page.forms, "content_hash": r.page.content_hash, "cached": r.cached,
     })))
 }
 
