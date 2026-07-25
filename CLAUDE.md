@@ -131,6 +131,11 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.
 
+Planned (agent-browsing expansion, Phases 12–16 — design locked in docs/agent-browsing.md):
+`web_dom` · `web_click` · `web_submit`, plus forms in the reader view, SPA salvage +
+`js_required`, opt-in cookie jar / headers / proxy, and multi-step politeness hygiene.
+No JS engine — ever in-core; a render *sidecar* is a documented door, not a phase.
+
 ---
 
 ## Environment variables (planned)
@@ -201,4 +206,5 @@ Same as the sibling repos. Agent `FORGE` (agent_id=`"FORGE"`, ⚒) for all Cereb
 | `docs/architecture.md` | crate graph, the cache/decay model, storage schema, integration points |
 | `docs/build-roadmap.md` | phased build order with gates (Phase 0–9) |
 | `docs/politeness.md` | the scraping-etiquette contract — rate limits, robots, UA, backoff |
+| `docs/agent-browsing.md` | the browsing expansion (Phases 12–16) — page model, click/submit verbs, SPA salvage, sessions, the JS-door contract |
 | `docs/follow-along.md` | the agent↔UI contract — web_view events + the "go here" steer protocol |
