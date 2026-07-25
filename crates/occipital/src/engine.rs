@@ -12,11 +12,12 @@ use serde::Serialize;
 use crate::cache::Cache;
 use crate::config::{
     Config, DEFAULT_DECAY_HALFLIFE_SECS, DEFAULT_GC_MIN_AGE_SECS, DEFAULT_GC_MIN_SALIENCE,
+    DEFAULT_SNAPSHOT_TTL_SECS,
 };
 use crate::curate::{make_auto_distiller, make_distiller, Distiller};
 use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
-use crate::extract::{extract_bytes, Page};
+use crate::extract::{extract_bytes, Form, Page};
 use crate::fetch::{Fetcher, PoliteFetcher};
 use crate::keys::Keys;
 use crate::providers::{provider_for, SearchProvider, SearchResult};
@@ -71,6 +72,29 @@ pub struct DistillReport {
 /// (each page is an LLM call); `limit` overrides within [1, 10].
 const DEFAULT_DISTILL_SWEEP: usize = 3;
 
+/// A link with its stable 1-based ordinal — the handle the interaction verbs
+/// (Phase 13) will click by.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedLink {
+    pub idx:  usize,
+    pub text: String,
+    pub url:  String,
+}
+
+/// The element registry for one page (`web_dom`): links + forms with stable
+/// ordinals, and whether a raw-HTML snapshot is currently held (i.e. whether
+/// an interaction could resolve against it without a re-fetch).
+#[derive(Debug, Clone, Serialize)]
+pub struct DomView {
+    pub url:          String,
+    pub title:        Option<String>,
+    pub links:        Vec<IndexedLink>,
+    pub forms:        Vec<Form>,
+    pub content_hash: String,
+    pub from_cache:   bool,
+    pub snapshot:     bool,
+}
+
 pub struct Engine {
     fetcher:            Arc<dyn Fetcher>,
     provider:           Box<dyn SearchProvider>,
@@ -87,6 +111,7 @@ pub struct Engine {
     decay_half_life_secs: u64,
     gc_min_salience:    f32,
     gc_min_age_secs:    u64,
+    snapshot_ttl_secs:  u64,
 }
 
 impl Engine {
@@ -114,6 +139,7 @@ impl Engine {
             decay_half_life_secs: cfg.decay_half_life_secs,
             gc_min_salience: cfg.gc_min_salience,
             gc_min_age_secs: cfg.gc_min_age_secs,
+            snapshot_ttl_secs: cfg.snapshot_ttl_secs,
         })
     }
 
@@ -141,6 +167,7 @@ impl Engine {
             decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
             gc_min_salience: DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs: DEFAULT_GC_MIN_AGE_SECS,
+            snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
         }
     }
 
@@ -171,11 +198,16 @@ impl Engine {
         self.provider.name()
     }
 
-    /// Store a freshly-fetched page in the cache + (if embeddings are on) index
-    /// its vector. No-op without a cache. Sync — never holds a lock across await.
-    fn index(&self, page: &Page, etag: Option<&str>, last_modified: Option<&str>, pinned: bool) -> anyhow::Result<()> {
+    /// Store a freshly-fetched page in the cache — its extracted form, a
+    /// raw-HTML snapshot (the interaction working memory), and (if embeddings
+    /// are on) its vector. No-op without a cache. Sync — never holds a lock
+    /// across await.
+    fn index(&self, page: &Page, html: &str, etag: Option<&str>, last_modified: Option<&str>, pinned: bool) -> anyhow::Result<()> {
         let Some(cache) = &self.cache else { return Ok(()) };
         cache.put_page(page, etag, last_modified, pinned)?;
+        if let Err(e) = cache.put_snapshot(&page.url, html) {
+            tracing::warn!("snapshot store failed for {}: {e}", page.url);
+        }
         if let Some(embedder) = &self.embedder {
             match embedder.embed(&embed_text(page)) {
                 Ok(v) => {
@@ -253,7 +285,8 @@ impl Engine {
                     return Ok((row.page.clone(), true));
                 }
                 let page = extract_bytes(&resp.body, &resp.final_url);
-                self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), row.pinned)?;
+                let html = String::from_utf8_lossy(&resp.body);
+                self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), row.pinned)?;
                 return Ok((page, false));
             }
         }
@@ -261,8 +294,9 @@ impl Engine {
         // Miss or fresh-forced: live fetch, preserving any existing pin.
         let resp = self.fetcher.get(url).await?;
         let page = extract_bytes(&resp.body, &resp.final_url);
+        let html = String::from_utf8_lossy(&resp.body);
         let pinned = existing.as_ref().map(|r| r.pinned).unwrap_or(false);
-        self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), pinned)?;
+        self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), pinned)?;
         Ok((page, false))
     }
 
@@ -270,8 +304,45 @@ impl Engine {
     pub async fn save(&self, url: &str) -> anyhow::Result<Page> {
         let resp = self.fetcher.get(url).await?;
         let page = extract_bytes(&resp.body, &resp.final_url);
-        self.index(&page, resp.etag.as_deref(), resp.last_modified.as_deref(), true)?;
+        let html = String::from_utf8_lossy(&resp.body);
+        self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), true)?;
         Ok(page)
+    }
+
+    /// The element registry for a page (`web_dom`): links + forms with stable
+    /// ordinals. Cache-first exactly like `fetch` (an uncached URL is fetched
+    /// and stored); `snapshot` reports whether a raw-HTML snapshot is held and
+    /// inside its TTL — i.e. whether an interaction verb could resolve these
+    /// ordinals without a re-fetch.
+    pub async fn dom(&self, url: &str, fresh: bool) -> anyhow::Result<DomView> {
+        let (page, from_cache) = self.fetch(url, fresh).await?;
+        let snapshot = self.snapshot_fresh(&page.url)?;
+        Ok(DomView {
+            links: page
+                .links
+                .iter()
+                .enumerate()
+                .map(|(i, l)| IndexedLink { idx: i + 1, text: l.text.clone(), url: l.url.clone() })
+                .collect(),
+            forms: page.forms,
+            url: page.url,
+            title: page.title,
+            content_hash: page.content_hash,
+            from_cache,
+            snapshot,
+        })
+    }
+
+    /// Whether a snapshot exists for `url` and is inside the snapshot TTL.
+    fn snapshot_fresh(&self, url: &str) -> anyhow::Result<bool> {
+        let Some(cache) = &self.cache else { return Ok(false) };
+        Ok(match cache.get_snapshot(url)? {
+            Some((_, ts)) => {
+                Utc::now().signed_duration_since(ts)
+                    < chrono::Duration::seconds(self.snapshot_ttl_secs as i64)
+            }
+            None => false,
+        })
     }
 
     /// Recall over **already-read** pages only (no live web). Semantic (cosine)
@@ -450,6 +521,13 @@ impl Engine {
     /// survive. Returns the number pruned.
     pub fn gc(&self) -> anyhow::Result<usize> {
         let Some(cache) = &self.cache else { return Ok(0) };
+        // Snapshots are working memory on a much shorter clock than pages —
+        // expire them first, silently (they are not knowledge being forgotten).
+        match cache.gc_snapshots(self.snapshot_ttl_secs) {
+            Ok(n) if n > 0 => tracing::debug!(pruned = n, "expired interaction snapshots"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("snapshot gc failed: {e}"),
+        }
         let now = Utc::now();
         let half = self.decay_half_life_secs as f64;
         let mut pruned = 0;
@@ -645,6 +723,51 @@ mod tests {
         assert_eq!(f.calls(), 1, "the re-asked search hit zero live requests");
     }
 
+    // ---- dom + snapshots (Phase 12) --------------------------------------
+
+    const FORM_HTML: &str = r#"<html><head><title>S</title></head><body><main>
+        <p>Find <a href="/a">first</a> and <a href="/b">second</a>.</p>
+        <form action="/search"><input type="search" name="q"><button>Go</button></form>
+        </main></body></html>"#;
+
+    #[tokio::test]
+    async fn fetch_stores_a_snapshot_and_dom_returns_the_registry() {
+        let f = Counting::new(FORM_HTML);
+        let e = engine(f.clone(), 3600);
+        e.fetch("https://e.test/", false).await.unwrap();
+
+        let view = e.dom("https://e.test/", false).await.unwrap();
+        assert!(view.from_cache, "dom is cache-first — no second live fetch");
+        assert_eq!(f.calls(), 1);
+        assert!(view.snapshot, "the fetch left a resolvable snapshot");
+        assert_eq!(view.forms.len(), 1);
+        assert_eq!(view.forms[0].action, "https://e.test/search");
+        assert_eq!(view.forms[0].fields[0].name, "q");
+        let idx: Vec<usize> = view.links.iter().map(|l| l.idx).collect();
+        assert_eq!(idx, vec![1, 2], "links carry stable 1-based ordinals");
+        assert_eq!(view.links[0].url, "https://e.test/a");
+    }
+
+    #[tokio::test]
+    async fn dom_fetches_an_uncached_url_and_reports_expired_snapshots() {
+        let f = Counting::new(FORM_HTML);
+        let cache = Arc::new(Cache::open_in_memory().unwrap());
+        let e = Engine::with_parts(f.clone(), Box::new(DuckDuckGo), Some(cache.clone()), 5, 3600);
+
+        let view = e.dom("https://e.test/", false).await.unwrap();
+        assert!(!view.from_cache, "uncached URL is fetched (read-through)");
+        assert_eq!(f.calls(), 1);
+        assert!(view.snapshot);
+
+        // Expire the snapshot: the registry still serves from the cached page,
+        // but honestly reports that an interaction would need a re-fetch.
+        cache.gc_snapshots(0).unwrap();
+        let view = e.dom("https://e.test/", false).await.unwrap();
+        assert!(view.from_cache);
+        assert!(!view.snapshot, "expired snapshot reported as absent");
+        assert_eq!(f.calls(), 1, "reporting it costs no live request");
+    }
+
     #[tokio::test]
     async fn save_pins_and_forget_evicts() {
         let f = Counting::new(HTML);
@@ -666,6 +789,7 @@ mod tests {
             byline: None,
             markdown: body.into(),
             links: vec![],
+            forms: vec![],
             content_hash: "h".into(),
         }
     }

@@ -114,8 +114,27 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "title":        page.title,
                 "markdown":     page.markdown,
                 "links":        page.links,
+                "forms":        page.forms,
                 "content_hash": page.content_hash,
                 "from_cache":   from_cache,
+            }))
+        }
+        "web_dom" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let fresh = args["fresh"].as_bool().unwrap_or(false);
+            let view = engine.dom(url, fresh).await?;
+            Ok(json!({
+                "kind":         "dom",
+                "url":          view.url,
+                "title":        view.title,
+                "links":        view.links,
+                "forms":        view.forms,
+                "content_hash": view.content_hash,
+                "from_cache":   view.from_cache,
+                "snapshot":     view.snapshot,
             }))
         }
         "web_save" => {
@@ -215,7 +234,7 @@ mod tests {
         let resp = tools_list(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
         let names: Vec<String> = resp["result"]["tools"].as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        for expected in ["web_search", "web_fetch", "web_recall", "web_save", "web_forget"] {
+        for expected in ["web_search", "web_fetch", "web_dom", "web_recall", "web_save", "web_forget"] {
             assert!(names.contains(&expected.to_string()), "must advertise {expected}: {names:?}");
         }
     }
@@ -244,6 +263,25 @@ mod tests {
         assert_eq!(out["kind"], "page");
         assert_eq!(out["title"], "T");
         assert!(out["markdown"].as_str().unwrap().contains("# Hi"));
+    }
+
+    #[tokio::test]
+    async fn web_dom_returns_the_element_registry() {
+        let html = r#"<html><head><title>S</title></head><body><main>
+            <p><a href="/next">next page</a></p>
+            <form action="/search"><input type="search" name="q"><button>Go</button></form>
+            </main></body></html>"#;
+        let msg = json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+            "params":{"name":"web_dom","arguments":{"url":"https://example.com/p"}}});
+        let resp = dispatch_tool(msg, engine_with(html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "dom");
+        assert_eq!(out["links"][0]["idx"], 1);
+        assert_eq!(out["links"][0]["url"], "https://example.com/next");
+        assert_eq!(out["forms"][0]["idx"], 1);
+        assert_eq!(out["forms"][0]["action"], "https://example.com/search");
+        assert_eq!(out["forms"][0]["fields"][0]["name"], "q");
+        assert_eq!(out["snapshot"], true, "the read-through fetch left a snapshot");
     }
 
     #[tokio::test]

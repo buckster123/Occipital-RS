@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::curate::Distillation;
-use crate::extract::{Link, Page};
+use crate::extract::{Form, Link, Page};
 use crate::providers::SearchResult;
 
 /// Cache size counters (for `stats`).
@@ -27,6 +27,7 @@ pub struct CacheStats {
     pub embeddings: i64,
     pub searches:   i64,
     pub distilled:  i64,
+    pub snapshots:  i64,
 }
 
 /// A cached page plus the metadata the read-through needs (validators for a
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS pages (
     byline        TEXT,
     markdown      TEXT NOT NULL,
     links         TEXT NOT NULL,            -- JSON array of {text,url}
+    forms         TEXT NOT NULL DEFAULT '[]', -- JSON array of Form (Phase 12)
     content_hash  TEXT NOT NULL,
     etag          TEXT,
     last_modified TEXT,
@@ -105,6 +107,11 @@ CREATE TABLE IF NOT EXISTS distillations (
     distilled_at TEXT NOT NULL              -- RFC3339
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS distill_fts USING fts5(url UNINDEXED, summary, terms);
+CREATE TABLE IF NOT EXISTS snapshots (
+    url        TEXT PRIMARY KEY,            -- FK to pages (cascade in delete_page)
+    html       TEXT NOT NULL,               -- raw fetched HTML (body-cap bounded)
+    fetched_at TEXT NOT NULL                -- RFC3339; TTL-pruned working memory
+);
 "#;
 
 impl Cache {
@@ -123,6 +130,7 @@ impl Cache {
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -132,35 +140,38 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT title, byline, markdown, links, content_hash, etag, last_modified, \
-                        fetched_at, pinned FROM pages WHERE url = ?1",
+                "SELECT title, byline, markdown, links, forms, content_hash, etag, \
+                        last_modified, fetched_at, pinned FROM pages WHERE url = ?1",
                 params![url],
                 |r| {
                     let links_json: String = r.get(3)?;
-                    let fetched_at: String = r.get(7)?;
+                    let forms_json: String = r.get(4)?;
+                    let fetched_at: String = r.get(8)?;
                     Ok((
                         r.get::<_, Option<String>>(0)?, // title
                         r.get::<_, Option<String>>(1)?, // byline
                         r.get::<_, String>(2)?,         // markdown
                         links_json,
-                        r.get::<_, String>(4)?,         // content_hash
-                        r.get::<_, Option<String>>(5)?, // etag
-                        r.get::<_, Option<String>>(6)?, // last_modified
+                        forms_json,
+                        r.get::<_, String>(5)?,         // content_hash
+                        r.get::<_, Option<String>>(6)?, // etag
+                        r.get::<_, Option<String>>(7)?, // last_modified
                         fetched_at,
-                        r.get::<_, i64>(8)? != 0,        // pinned
+                        r.get::<_, i64>(9)? != 0,        // pinned
                     ))
                 },
             )
             .optional()?;
 
-        let Some((title, byline, markdown, links_json, content_hash, etag, last_modified, fetched_at, pinned)) = row
+        let Some((title, byline, markdown, links_json, forms_json, content_hash, etag, last_modified, fetched_at, pinned)) = row
         else {
             return Ok(None);
         };
         let links: Vec<Link> = serde_json::from_str(&links_json).unwrap_or_default();
+        let forms: Vec<Form> = serde_json::from_str(&forms_json).unwrap_or_default();
         let fetched_at = parse_ts(&fetched_at)?;
         Ok(Some(PageRow {
-            page: Page { url: url.to_string(), title, byline, markdown, links, content_hash },
+            page: Page { url: url.to_string(), title, byline, markdown, links, forms, content_hash },
             etag,
             last_modified,
             fetched_at,
@@ -180,20 +191,22 @@ impl Cache {
     ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         let links = serde_json::to_string(&page.links)?;
+        let forms = serde_json::to_string(&page.forms)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO pages \
-               (url, title, byline, markdown, links, content_hash, etag, last_modified, \
+               (url, title, byline, markdown, links, forms, content_hash, etag, last_modified, \
                 fetched_at, last_access, access_count, salience, pinned) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,0,1.0,?10) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,0,1.0,?11) \
              ON CONFLICT(url) DO UPDATE SET \
                title=excluded.title, byline=excluded.byline, markdown=excluded.markdown, \
-               links=excluded.links, content_hash=excluded.content_hash, etag=excluded.etag, \
-               last_modified=excluded.last_modified, fetched_at=excluded.fetched_at, \
-               last_access=excluded.last_access, pinned=excluded.pinned",
+               links=excluded.links, forms=excluded.forms, content_hash=excluded.content_hash, \
+               etag=excluded.etag, last_modified=excluded.last_modified, \
+               fetched_at=excluded.fetched_at, last_access=excluded.last_access, \
+               pinned=excluded.pinned",
             params![
-                page.url, page.title, page.byline, page.markdown, links, page.content_hash,
-                etag, last_modified, now, pinned as i64
+                page.url, page.title, page.byline, page.markdown, links, forms,
+                page.content_hash, etag, last_modified, now, pinned as i64
             ],
         )?;
         // Keep the FTS keyword index in sync (delete-then-insert; FTS5 has no upsert).
@@ -436,7 +449,43 @@ impl Cache {
         conn.execute("DELETE FROM embeddings WHERE url=?1", params![url])?;
         conn.execute("DELETE FROM distillations WHERE url=?1", params![url])?;
         conn.execute("DELETE FROM distill_fts WHERE url=?1", params![url])?;
+        conn.execute("DELETE FROM snapshots WHERE url=?1", params![url])?;
         Ok(removed)
+    }
+
+    // ---- snapshots (Phase 12: interaction working memory) -----------------
+
+    /// Store (or replace) a page's raw-HTML snapshot. Working memory for the
+    /// interaction verbs — never recalled, TTL-pruned by [`gc_snapshots`](Self::gc_snapshots).
+    pub fn put_snapshot(&self, url: &str, html: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO snapshots (url, html, fetched_at) VALUES (?1,?2,?3)",
+            params![url, html, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The stored snapshot + its capture time, if one exists. Freshness policy
+    /// (the TTL) is the engine's call, mirroring `fetched_at` on pages.
+    pub fn get_snapshot(&self, url: &str) -> anyhow::Result<Option<(String, DateTime<Utc>)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT html, fetched_at FROM snapshots WHERE url=?1",
+                params![url],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((html, fetched_at)) = row else { return Ok(None) };
+        Ok(Some((html, parse_ts(&fetched_at)?)))
+    }
+
+    /// Prune snapshots older than `ttl_secs`. Returns the number removed.
+    pub fn gc_snapshots(&self, ttl_secs: u64) -> anyhow::Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM snapshots WHERE fetched_at < ?1", params![cutoff])?)
     }
 
     pub fn set_pinned(&self, url: &str, pinned: bool) -> anyhow::Result<bool> {
@@ -470,6 +519,7 @@ impl Cache {
             embeddings: count("SELECT COUNT(*) FROM embeddings"),
             searches:   count("SELECT COUNT(*) FROM searches"),
             distilled:  count("SELECT COUNT(*) FROM distillations"),
+            snapshots:  count("SELECT COUNT(*) FROM snapshots"),
         }
     }
 
@@ -500,6 +550,20 @@ impl Cache {
             )
             .unwrap();
     }
+}
+
+/// Additive column migrations for DBs created by earlier schema versions —
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table.
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let has_forms: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name='forms'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_forms == 0 {
+        conn.execute("ALTER TABLE pages ADD COLUMN forms TEXT NOT NULL DEFAULT '[]'", [])?;
+    }
+    Ok(())
 }
 
 fn parse_ts(s: &str) -> anyhow::Result<DateTime<Utc>> {
@@ -536,6 +600,7 @@ mod tests {
             byline: None,
             markdown: body.into(),
             links: vec![Link { text: "x".into(), url: "https://e.test/x".into() }],
+            forms: vec![],
             content_hash: "abc".into(),
         }
     }
@@ -656,6 +721,74 @@ mod tests {
         assert_eq!(c.keyword_search("cerebro", 5).unwrap(), vec!["https://e.test/p"]);
         // A body hit is not duplicated by its distillation hit.
         assert_eq!(c.keyword_search("memory systems cerebro", 5).unwrap().len(), 1);
+    }
+
+    // ---- forms + snapshots (Phase 12) --------------------------------------
+
+    #[test]
+    fn forms_roundtrip_through_the_page_store() {
+        use crate::extract::{Form, FormField};
+        let c = Cache::open_in_memory().unwrap();
+        let mut p = page("https://e.test/f", "body");
+        p.forms = vec![Form {
+            idx:    1,
+            action: "https://e.test/search".into(),
+            method: "get".into(),
+            fields: vec![FormField { name: "q".into(), kind: "text".into(), ..Default::default() }],
+            submit: Some("Go".into()),
+        }];
+        c.put_page(&p, None, None, false).unwrap();
+        let row = c.get_page("https://e.test/f").unwrap().unwrap();
+        assert_eq!(row.page.forms, p.forms, "forms JSON roundtrips");
+    }
+
+    #[test]
+    fn snapshot_roundtrips_ttl_prunes_and_delete_cascades() {
+        let c = Cache::open_in_memory().unwrap();
+        c.put_page(&page("https://e.test/s", "body"), None, None, false).unwrap();
+        c.put_snapshot("https://e.test/s", "<html>raw</html>").unwrap();
+        let (html, _ts) = c.get_snapshot("https://e.test/s").unwrap().unwrap();
+        assert_eq!(html, "<html>raw</html>");
+        assert_eq!(c.stats().snapshots, 1);
+
+        assert_eq!(c.gc_snapshots(3600).unwrap(), 0, "fresh snapshot survives its TTL");
+        assert_eq!(c.gc_snapshots(0).unwrap(), 1, "expired snapshot is pruned");
+        assert!(c.get_snapshot("https://e.test/s").unwrap().is_none());
+
+        c.put_snapshot("https://e.test/s", "<html>again</html>").unwrap();
+        c.delete_page("https://e.test/s").unwrap();
+        assert!(c.get_snapshot("https://e.test/s").unwrap().is_none(), "delete cascades");
+        assert_eq!(c.stats().snapshots, 0);
+    }
+
+    #[test]
+    fn old_schema_db_gains_the_forms_column_on_open() {
+        // A DB created before Phase 12: pages without `forms`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pages (
+                    url TEXT PRIMARY KEY, title TEXT, byline TEXT,
+                    markdown TEXT NOT NULL, links TEXT NOT NULL,
+                    content_hash TEXT NOT NULL, etag TEXT, last_modified TEXT,
+                    fetched_at TEXT NOT NULL, last_access TEXT NOT NULL,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    salience REAL NOT NULL DEFAULT 1.0,
+                    pinned INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO pages (url, markdown, links, content_hash, fetched_at, last_access)
+                 VALUES ('https://e.test/old', 'legacy body', '[]', 'h',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let c = Cache::open(&path).unwrap();
+        let row = c.get_page("https://e.test/old").unwrap().unwrap();
+        assert_eq!(row.page.markdown, "legacy body", "legacy row readable after migration");
+        assert!(row.page.forms.is_empty(), "migrated column defaults to no forms");
+        // And the migrated table accepts new-format writes.
+        c.put_page(&page("https://e.test/new", "x"), None, None, false).unwrap();
     }
 
     #[test]

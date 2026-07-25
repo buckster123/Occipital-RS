@@ -31,6 +31,11 @@ pub const DEFAULT_DECAY_HALFLIFE_SECS: u64 = 604_800; // 7 days
 pub const DEFAULT_GC_MIN_SALIENCE: f32 = 0.15; // prune below this effective salience
 pub const DEFAULT_GC_MIN_AGE_SECS: u64 = 86_400; // never GC a page fetched < 1 day ago
 
+// Interaction snapshots (Phase 12): raw-HTML working memory so the coming
+// click/submit verbs can resolve element ordinals without a re-fetch. Short TTL
+// by design — snapshots are not knowledge and never recalled.
+pub const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 3_600; // 1 hour
+
 // Compile-time guard: a conservative posture is the whole point — a careless
 // edit that makes the crawler aggressive must fail the build, not just a test.
 const _: () = assert!(DEFAULT_RATE_PER_DOMAIN <= 1.0, "default ≤ 1 req/s per domain");
@@ -68,6 +73,7 @@ pub struct Config {
     pub decay_half_life_secs: u64,
     pub gc_min_salience:    f32,
     pub gc_min_age_secs:    u64,
+    pub snapshot_ttl_secs:  u64,
     /// LLM curation (the distillation layer) — see `curate`.
     pub curate:             CurateConfig,
 }
@@ -96,6 +102,7 @@ impl Config {
             decay_half_life_secs: env_parse("OCCIPITAL_DECAY_HALFLIFE_SECS", DEFAULT_DECAY_HALFLIFE_SECS),
             gc_min_salience:    env_parse("OCCIPITAL_GC_MIN_SALIENCE", DEFAULT_GC_MIN_SALIENCE),
             gc_min_age_secs:    env_parse("OCCIPITAL_GC_MIN_AGE_SECS", DEFAULT_GC_MIN_AGE_SECS),
+            snapshot_ttl_secs:  env_parse("OCCIPITAL_SNAPSHOT_TTL_SECS", DEFAULT_SNAPSHOT_TTL_SECS),
             curate:             CurateConfig::from_env(),
         })
     }
@@ -168,6 +175,7 @@ mod tests {
             decay_half_life_secs: DEFAULT_DECAY_HALFLIFE_SECS,
             gc_min_salience:    DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs:    DEFAULT_GC_MIN_AGE_SECS,
+            snapshot_ttl_secs:  DEFAULT_SNAPSHOT_TTL_SECS,
             curate:             CurateConfig::default(),
         }
     }

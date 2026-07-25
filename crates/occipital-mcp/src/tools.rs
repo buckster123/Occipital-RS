@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 pub const TOOL_NAMES: &[&str] = &[
     "web_search",
     "web_fetch",
+    "web_dom",
     "web_recall",
     "web_save",
     "web_forget",
@@ -41,6 +42,18 @@ fn tool_schema(name: &str) -> Value {
                 "type": "object",
                 "properties": {
                     "url":   { "type": "string", "description": "The URL to fetch" },
+                    "fresh": { "type": "boolean", "description": "Bypass the cache and force a live fetch (default: false)" }
+                },
+                "required": ["url"]
+            }
+        }),
+        "web_dom" => json!({
+            "name": "web_dom",
+            "description": "The element registry of a page: its links and forms with stable ordinals (link idx, form idx, field names) — the handles the interaction verbs address. Cache-first like web_fetch; `snapshot` reports whether the raw page is still held for ordinal resolution. Use when you need the interactive surface rather than the prose.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url":   { "type": "string", "description": "The page whose element registry to return" },
                     "fresh": { "type": "boolean", "description": "Bypass the cache and force a live fetch (default: false)" }
                 },
                 "required": ["url"]

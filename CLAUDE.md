@@ -122,7 +122,8 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 | Tool | Purpose |
 |------|---------|
 | `web_search` | query → ranked results (cache-first, then live providers) |
-| `web_fetch` | url → reader-mode markdown + links (cache-first, conditional refresh) |
+| `web_fetch` | url → reader-mode markdown + links + forms (cache-first, conditional refresh) |
+| `web_dom` | url → the element registry: links + forms with stable ordinals (the interaction handles); reports whether a raw-HTML snapshot is held |
 | `web_recall` | semantic/keyword query over **already-read** pages only (no live hit); a distilled page recalls as its summary + tags, not a raw snippet |
 | `web_save` | force-cache a url (pin; exempt from decay until TTL) |
 | `web_forget` | evict a url / matching set from the cache |
@@ -131,9 +132,10 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.
 
-Planned (agent-browsing expansion, Phases 12–16 — design locked in docs/agent-browsing.md):
-`web_dom` · `web_click` · `web_submit`, plus forms in the reader view, SPA salvage +
-`js_required`, opt-in cookie jar / headers / proxy, and multi-step politeness hygiene.
+Planned (agent-browsing expansion, Phases 13–16 — design locked in docs/agent-browsing.md;
+Phase 12's page model — forms in the reader view, the element registry, `web_dom`,
+snapshots — has shipped): `web_click` · `web_submit`, SPA salvage + `js_required`,
+opt-in cookie jar / headers / proxy, and multi-step politeness hygiene.
 No JS engine — ever in-core; a render *sidecar* is a documented door, not a phase.
 
 ---
@@ -149,6 +151,7 @@ No JS engine — ever in-core; a render *sidecar* is a documented door, not a ph
 | `OCCIPITAL_RATE_PER_DOMAIN` | `0.5` | requests/sec per domain (token bucket + jitter) |
 | `OCCIPITAL_MAX_CONCURRENCY` | `4` | global in-flight fetch cap |
 | `OCCIPITAL_FRESH_TTL_SECS` | `86400` | default cache freshness window |
+| `OCCIPITAL_SNAPSHOT_TTL_SECS` | `3600` | raw-HTML interaction-snapshot retention (working memory for the browsing verbs; pruned by `gc`) |
 | `OCCIPITAL_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo`/`searxng`/`brave`/`tavily`/`bing` |
 | `OCCIPITAL_SEARXNG_URL` | unset | SearXNG instance base URL |
 | `OCCIPITAL_<PROVIDER>_KEY` | unset | keyed-provider API key (per provider); overrides the key file |

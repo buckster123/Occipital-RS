@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/stats", get(stats))
         .route("/search", get(search))
         .route("/fetch", get(fetch))
+        .route("/dom", get(dom))
         .route("/recall", get(recall))
         .route("/distill", post(distill))
         .route("/save", post(save))
@@ -137,7 +138,18 @@ async fn fetch(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult 
     let (page, from_cache) = s.engine.fetch(&q.url, q.fresh).await?;
     Ok(Json(json!({
         "kind": "page", "url": page.url, "title": page.title, "markdown": page.markdown,
-        "links": page.links, "content_hash": page.content_hash, "from_cache": from_cache,
+        "links": page.links, "forms": page.forms, "content_hash": page.content_hash,
+        "from_cache": from_cache,
+    })))
+}
+
+/// `GET /dom` — the element registry (links + forms with stable ordinals).
+async fn dom(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult {
+    let view = s.engine.dom(&q.url, q.fresh).await?;
+    Ok(Json(json!({
+        "kind": "dom", "url": view.url, "title": view.title, "links": view.links,
+        "forms": view.forms, "content_hash": view.content_hash,
+        "from_cache": view.from_cache, "snapshot": view.snapshot,
     })))
 }
 
