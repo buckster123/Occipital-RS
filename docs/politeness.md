@@ -45,6 +45,17 @@ above it can bypass it (the only network door).
   via config — that's their call on their own infra, not a built-in evasion feature.)
 - No login-walled or paywalled content bypass.
 
+## Sessions & identity (Phase 15)
+
+Cookies are **off by default** (`OCCIPITAL_COOKIES=0`) — with them off no jar exists and nothing
+is stored or sent. Enabled, the node keeps **one jar: one identity**, so multi-step flows and
+*operator-provisioned* logins work. The boundary is unchanged: sessions are for continuity, never
+for farming or rotating identities. The honest user-agent is **not** overridable by per-domain
+header rules (`user-agent`, `cookie`, `host`, `content-length` are refused with a warning), a
+cross-site `Domain` attribute on a `Set-Cookie` is rejected outright, `Secure` cookies never
+travel over http, and `OCCIPITAL_PROXY` is topology (one proxy, logged at startup), not rotation.
+Cookie values are credentials: the jar is written `0600` and the CLI redacts them.
+
 ## Why this also makes the agent *better*
 
 Politeness and quality are the same axis here. Rate-limiting + caching means the agent's web
@@ -63,6 +74,10 @@ agent is a *worse* agent — good citizenship is self-interest.
 | `OCCIPITAL_FETCH_TIMEOUT_SECS` | `30` | per-request timeout (Nano-safe) |
 | `OCCIPITAL_MAX_BODY_BYTES` | `2_000_000` | per-page body cap |
 | `OCCIPITAL_SEARCH_TOP_N` | `5` | results fetched per search |
+| `OCCIPITAL_COOKIES` | `0` | opt-in session jar (one jar, one identity) |
+| `OCCIPITAL_COOKIES_FILE` | `<data_dir>/occipital/cookies.json` | persisted jar (`0600`) |
+| `OCCIPITAL_HEADERS_FILE` | unset | per-domain extra headers (UA not overridable) |
+| `OCCIPITAL_PROXY` | unset | explicit proxy — topology, never rotation |
 
 ## Testing politeness
 

@@ -74,6 +74,13 @@ pub struct Config {
     pub gc_min_salience:    f32,
     pub gc_min_age_secs:    u64,
     pub snapshot_ttl_secs:  u64,
+    /// Opt-in persistent cookie jar (sessions & identity — see `session`).
+    pub cookies_enabled:    bool,
+    pub cookies_file:       PathBuf,
+    /// Optional per-domain extra request headers (the UA is never overridable).
+    pub headers_file:       Option<PathBuf>,
+    /// Explicit proxy URL. Topology, not evasion: one proxy, never rotated.
+    pub proxy:              Option<String>,
     /// LLM curation (the distillation layer) — see `curate`.
     pub curate:             CurateConfig,
 }
@@ -103,6 +110,11 @@ impl Config {
             gc_min_salience:    env_parse("OCCIPITAL_GC_MIN_SALIENCE", DEFAULT_GC_MIN_SALIENCE),
             gc_min_age_secs:    env_parse("OCCIPITAL_GC_MIN_AGE_SECS", DEFAULT_GC_MIN_AGE_SECS),
             snapshot_ttl_secs:  env_parse("OCCIPITAL_SNAPSHOT_TTL_SECS", DEFAULT_SNAPSHOT_TTL_SECS),
+            cookies_enabled:    env_bool("OCCIPITAL_COOKIES", false),
+            cookies_file:       cookies_file(),
+            headers_file:       env::var("OCCIPITAL_HEADERS_FILE").ok()
+                                    .filter(|s| !s.is_empty()).map(PathBuf::from),
+            proxy:              env::var("OCCIPITAL_PROXY").ok().filter(|s| !s.is_empty()),
             curate:             CurateConfig::from_env(),
         })
     }
@@ -135,6 +147,14 @@ fn keys_file() -> PathBuf {
         return PathBuf::from(p);
     }
     occipital_dir().join("keys.json")
+}
+
+/// Cookie jar: `OCCIPITAL_COOKIES_FILE`, else `<data_dir>/occipital/cookies.json`.
+fn cookies_file() -> PathBuf {
+    if let Ok(p) = env::var("OCCIPITAL_COOKIES_FILE") {
+        return PathBuf::from(p);
+    }
+    occipital_dir().join("cookies.json")
 }
 
 fn occipital_dir() -> PathBuf {
@@ -176,6 +196,10 @@ mod tests {
             gc_min_salience:    DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs:    DEFAULT_GC_MIN_AGE_SECS,
             snapshot_ttl_secs:  DEFAULT_SNAPSHOT_TTL_SECS,
+            cookies_enabled:    false,
+            cookies_file:       PathBuf::from("/tmp/cookies.json"),
+            headers_file:       None,
+            proxy:              None,
             curate:             CurateConfig::default(),
         }
     }
