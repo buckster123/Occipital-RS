@@ -26,6 +26,7 @@ The core lib `occipital` is a pipeline with a cache wrapped around it. The three
 | `curate` | the distillation layer (the knowledge hub): a tiered LLM `Distiller` (Ollama local/LAN → Anthropic API, mirroring Cerebro's `describe_image`) turns a cached page into summary/key-points/entities/tags. Explicit via `web_distill`/CLI/API; **opt-in background auto-curation** (`OCCIPITAL_AUTO_DISTILL` — `local` pins the sweep to Ollama so it never spends API tokens; rolling-24h budget cap) makes pages distill themselves as they're read. Recall serves the distillation over the raw body, and distilled terms are FTS-indexed so curation widens even Nano keyword recall. Talks to an inference endpoint, not the open web — plain reqwest, not the polite `Fetcher`. |
 | `decay` | salience update + GC. Web pages lose salience by age + disuse; the GC prunes stale, unread, low-salience pages. The Cerebro-dream-pruning analog. |
 | `rank` | result ordering: `relevance × freshness × salience`. Keeps stale cached pages from outranking fresh signal in semantic/keyword search. |
+| `session` | sessions & identity (Phase 15): the opt-in persistent `CookieJar` (reqwest `CookieStore` impl with RFC-6265 matching; expiring cookies written 0600, session cookies memory-only) and `HeaderRules` (per-domain extra headers; UA/cookie/host never overridable). One jar, one identity. |
 | `config` | env + file config; provider keys (0600); tier detection (Nano/Micro+). |
 
 ## Storage schema (first cut)

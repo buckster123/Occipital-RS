@@ -19,7 +19,12 @@ enum Command {
     /// Search the web (cache-first).
     Search { query: String },
     /// Fetch a URL as reader-mode Markdown.
-    Fetch { url: String },
+    Fetch {
+        url: String,
+        /// Bypass the cache and force a live fetch (parity with MCP/API).
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Show a page's element registry — links + forms with stable ordinals.
     Dom { url: String },
     /// Click an element by registry ordinal: link:N follows it, form:N submits it.
@@ -51,8 +56,23 @@ enum Command {
         #[command(subcommand)]
         action: KeysAction,
     },
+    /// Inspect or clear the session cookie jar (needs OCCIPITAL_COOKIES=1).
+    Cookies {
+        #[command(subcommand)]
+        action: CookiesAction,
+    },
     /// Show config + tier + cache stats.
     Status,
+}
+
+/// Cookie values are credentials — never print them in full.
+fn redact(value: &str) -> String {
+    let n = value.chars().count();
+    if n <= 4 {
+        return "****".into();
+    }
+    let head: String = value.chars().take(2).collect();
+    format!("{head}…({n} chars)")
 }
 
 /// `--field name=value` parser.
@@ -60,6 +80,14 @@ fn parse_field(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.trim().to_string(), v.to_string()))
         .ok_or_else(|| format!("expected name=value, got {s:?}"))
+}
+
+#[derive(Subcommand)]
+enum CookiesAction {
+    /// List stored cookies (values redacted).
+    List,
+    /// Drop cookies for one domain, or all of them.
+    Clear { domain: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -87,9 +115,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n{}. {}\n   {}\n   {}", r.rank + 1, r.title, r.url, r.snippet);
             }
         }
-        Command::Fetch { url } => {
+        Command::Fetch { url, fresh } => {
             let engine = Engine::from_config(&config)?;
-            let (page, from_cache) = engine.fetch(&url, false).await?;
+            let (page, from_cache) = engine.fetch(&url, fresh).await?;
             if from_cache {
                 eprintln!("[served from cache]");
             }
@@ -186,6 +214,19 @@ async fn main() -> anyhow::Result<()> {
             println!("db:        {}", config.db_path.display());
             println!("robots:    {}", config.respect_robots);
             println!("rate/dom:  {} req/s", config.rate_per_domain);
+            println!(
+                "cookies:   {}",
+                if config.cookies_enabled {
+                    format!("on ({})", config.cookies_file.display())
+                } else {
+                    "off".into()
+                }
+            );
+            println!("proxy:     {}", config.proxy.as_deref().unwrap_or("(none)"));
+            println!(
+                "headers:   {}",
+                config.headers_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())
+            );
             println!("curation:  {:?}", config.curate.backend);
             println!(
                 "auto:      {:?} (every {}s, cap {}/24h)",
@@ -197,6 +238,30 @@ async fn main() -> anyhow::Result<()> {
             let engine = Engine::from_config(&config)?;
             let pruned = engine.gc()?;
             println!("garbage-collected {pruned} stale page(s)");
+        }
+        Command::Cookies { action } => {
+            if !config.cookies_enabled {
+                eprintln!("[cookies are off — set OCCIPITAL_COOKIES=1 to enable the session jar]");
+            }
+            let jar = occipital::CookieJar::load(&config.cookies_file, true);
+            match action {
+                CookiesAction::List => {
+                    let all = jar.list();
+                    if all.is_empty() {
+                        println!("(no stored cookies)");
+                    }
+                    for c in all {
+                        let scope = if c.host_only { c.domain.clone() } else { format!(".{}", c.domain) };
+                        let exp = c.expires_rfc3339().unwrap_or_else(|| "session".into());
+                        let flags = if c.secure { " secure" } else { "" };
+                        println!("{scope}{}  {} = {}  (expires {exp}{flags})", c.path, c.name, redact(&c.value));
+                    }
+                }
+                CookiesAction::Clear { domain } => {
+                    let n = jar.clear(domain.as_deref());
+                    println!("cleared {n} cookie(s)");
+                }
+            }
         }
         Command::Keys { action } => {
             let mut keys = Keys::load(&config.keys_file);

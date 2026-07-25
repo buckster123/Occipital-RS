@@ -4,12 +4,12 @@
 //! search providers, and a Cerebro-style decaying knowledge cache. Three thin
 //! binaries (`occipital-mcp` / `-api` / `-cli`) drive this one library.
 //!
-//! Build status: **Phase 14 — agent browsing: SPA salvage + honest JS signaling**.
-//! Phases 0–13 complete (standalone, the ApexOS follow-along UI, the knowledge
-//! hub, the page model, the interaction verbs); thin pages now mine the data
-//! embedded in static HTML (`salvaged: true`) and truly client-only pages say
-//! so (`js_required: true`) — no script is ever executed. See
-//! `docs/agent-browsing.md` + `docs/build-roadmap.md`.
+//! Build status: **Phase 15 — agent browsing: sessions & identity**.
+//! Phases 0–14 complete (standalone, the ApexOS follow-along UI, the knowledge
+//! hub, the page model, the interaction verbs, SPA salvage); [`session`] adds
+//! the **opt-in** persistent cookie jar, per-domain header rules (the honest UA
+//! stays locked), and an explicit proxy — one jar, one identity. See
+//! `docs/agent-browsing.md` + `docs/politeness.md`.
 
 pub mod cache;
 pub mod config;
@@ -24,6 +24,7 @@ pub mod providers;
 pub mod ratelimit;
 pub mod robots;
 mod salvage;
+pub mod session;
 
 pub use cache::{Cache, CacheStats};
 pub use config::{Config, Tier};
@@ -37,6 +38,7 @@ pub use keys::Keys;
 pub use extract::{extract, extract_bytes, Form, FormField, Link, Page};
 pub use fetch::{FetchResponse, Fetcher, HttpRequest, Method, PoliteFetcher};
 pub use providers::{SearchProvider, SearchResult};
+pub use session::{Cookie, CookieJar, HeaderRules};
 
 /// The crate version (the `serverInfo.version` an MCP client sees).
 pub fn version() -> &'static str {

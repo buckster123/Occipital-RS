@@ -134,10 +134,11 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.
 
-Planned (agent-browsing expansion, Phases 15–16 — design locked in docs/agent-browsing.md;
-Phases 12–14 shipped: the page model, the interaction verbs, and SPA salvage above):
-opt-in cookie jar / headers / proxy (sessions & identity), and multi-step politeness
-hygiene. No JS engine — ever in-core; a render *sidecar* is a documented door, not a phase.
+Planned (agent-browsing expansion, Phase 16 — design locked in docs/agent-browsing.md;
+Phases 12–15 shipped: the page model, the interaction verbs, SPA salvage, and sessions &
+identity): multi-step politeness hygiene (honor `Crawl-delay`, eTLD+1 rate buckets, robots
+cache TTL, request log, `--obey-robots` alias). No JS engine — ever in-core; a render
+*sidecar* is a documented door, not a phase.
 
 ---
 
@@ -153,6 +154,10 @@ hygiene. No JS engine — ever in-core; a render *sidecar* is a documented door,
 | `OCCIPITAL_MAX_CONCURRENCY` | `4` | global in-flight fetch cap |
 | `OCCIPITAL_FRESH_TTL_SECS` | `86400` | default cache freshness window |
 | `OCCIPITAL_SNAPSHOT_TTL_SECS` | `3600` | raw-HTML interaction-snapshot retention (working memory for the browsing verbs; pruned by `gc`) |
+| `OCCIPITAL_COOKIES` | `0` | opt-in session cookie jar — one jar, one identity (never farming/rotation) |
+| `OCCIPITAL_COOKIES_FILE` | `<data_dir>/occipital/cookies.json` | persisted jar (0600); session cookies stay in memory |
+| `OCCIPITAL_HEADERS_FILE` | unset | per-domain extra request headers as JSON (`*` / `.suffix` / exact host); UA never overridable |
+| `OCCIPITAL_PROXY` | unset | explicit proxy URL (topology, not evasion; system proxy is logged when in effect) |
 | `OCCIPITAL_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo`/`searxng`/`brave`/`tavily`/`bing` |
 | `OCCIPITAL_SEARXNG_URL` | unset | SearXNG instance base URL |
 | `OCCIPITAL_<PROVIDER>_KEY` | unset | keyed-provider API key (per provider); overrides the key file |

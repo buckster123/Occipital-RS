@@ -16,6 +16,7 @@ use url::Url;
 use crate::config::Config;
 use crate::ratelimit::{backoff_delay, DomainLimiter};
 use crate::robots::Robots;
+use crate::session::{merge_headers, CookieJar, HeaderRules};
 
 /// Where a response came from (the cache layer adds `Cache` in a later phase).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,18 +135,59 @@ pub struct PoliteFetcher {
     ua_token:       String,
     max_body_bytes: usize,
     max_retries:    u32,
+    /// Operator-configured per-domain headers (empty by default).
+    header_rules:   HeaderRules,
+    /// The session jar, when `OCCIPITAL_COOKIES` is on. Held so the fetcher can
+    /// report/manage it; reqwest drives it automatically as the cookie provider.
+    cookies:        Option<Arc<CookieJar>>,
 }
 
 impl PoliteFetcher {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(cfg.user_agent.clone())
             .timeout(Duration::from_secs(cfg.fetch_timeout_secs))
             .gzip(true)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()?;
+            .redirect(reqwest::redirect::Policy::limited(5));
+
+        // Sessions are opt-in: with cookies off, no jar exists and nothing is
+        // stored, sent, or written.
+        let cookies = if cfg.cookies_enabled {
+            let jar = Arc::new(CookieJar::load(&cfg.cookies_file, true));
+            tracing::info!(file = %cfg.cookies_file.display(), "cookie jar enabled");
+            builder = builder.cookie_provider(jar.clone());
+            Some(jar)
+        } else {
+            None
+        };
+
+        // Proxy is topology, not evasion — one proxy, explicit and logged.
+        match &cfg.proxy {
+            Some(p) => {
+                builder = builder.proxy(reqwest::Proxy::all(p.as_str())?);
+                tracing::info!(proxy = %p, "explicit proxy configured");
+            }
+            None => {
+                // reqwest honors system proxy env by default; say so rather
+                // than routing traffic silently.
+                for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+                    if let Ok(v) = std::env::var(var) {
+                        if !v.is_empty() {
+                            tracing::info!(%var, value = %v, "system proxy in effect (set OCCIPITAL_PROXY to be explicit)");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let header_rules = HeaderRules::load(cfg.headers_file.as_deref());
+        if !header_rules.is_empty() {
+            tracing::info!("per-domain header rules loaded");
+        }
+
         Ok(Self {
-            client,
+            client: builder.build()?,
             limiter:        DomainLimiter::new(cfg.rate_per_domain, JITTER_FRAC),
             sem:            Semaphore::new(cfg.max_concurrency.max(1)),
             robots:         Mutex::new(HashMap::new()),
@@ -153,7 +195,14 @@ impl PoliteFetcher {
             ua_token:       ua_token(&cfg.user_agent),
             max_body_bytes: cfg.max_body_bytes,
             max_retries:    cfg.max_retries,
+            header_rules,
+            cookies,
         })
+    }
+
+    /// The live session jar (`None` when cookies are off) — CLI/ops surface.
+    pub fn cookie_jar(&self) -> Option<Arc<CookieJar>> {
+        self.cookies.clone()
     }
 
     /// The rate-limit bucket key for a URL. Host-level for now; eTLD+1 grouping
@@ -209,6 +258,14 @@ impl PoliteFetcher {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> anyhow::Result<FetchResponse> {
+        // Operator header rules first, so an explicit per-request header
+        // (validators, provider keys) always wins on a name collision.
+        let headers = match parsed.host_str() {
+            Some(h) if !self.header_rules.is_empty() => {
+                merge_headers(self.header_rules.for_host(h), headers)
+            }
+            _ => headers,
+        };
         self.limiter.throttle(&Self::rate_key(&parsed)).await; // no permit held while waiting
         let _permit = self.sem.acquire().await?;
         let retriable = method_retriable(method);
