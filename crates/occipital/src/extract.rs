@@ -82,6 +82,12 @@ pub struct Page {
     pub links:        Vec<Link>,
     /// The page's interactive surface (document-wide, ordinal-addressed).
     pub forms:        Vec<Form>,
+    /// The body was thin and part of `markdown` was mined from data embedded
+    /// in the static HTML (state blobs / ld+json / noscript) — see `salvage`.
+    pub salvaged:     bool,
+    /// The page renders client-side and nothing was recoverable — the honest
+    /// "this isn't blank, it needs JavaScript" signal.
+    pub js_required:  bool,
     /// Stable content fingerprint (FNV-1a of the markdown) for dedup + change
     /// detection. Deterministic across runs, unlike `DefaultHasher`.
     pub content_hash: String,
@@ -151,15 +157,51 @@ pub fn extract(html: &str, base_url: &str) -> Page {
         }
     }
 
-    let markdown = normalize(&out);
+    let mut markdown = normalize(&out);
+    let mut links = acc.links;
+    let mut salvaged = false;
+    let mut js_required = false;
+
+    // A thin body on a scripts-heavy page usually means client-side rendering.
+    // Mine what the static HTML *does* carry (Phase 14) — and when even that
+    // fails, say so instead of returning near-silence.
+    if crate::salvage::is_thin(&markdown) {
+        if let Some(s) = crate::salvage::salvage(&doc, base.as_ref()) {
+            let mut md = String::new();
+            if !markdown.is_empty() {
+                md.push_str(&markdown);
+                md.push_str("\n\n");
+            }
+            md.push_str("*[salvaged: this page renders client-side — the content below was mined from data embedded in the static HTML]*\n\n");
+            md.push_str(&s.markdown);
+            markdown = normalize(&md);
+            for l in s.links {
+                if !links.iter().any(|x| x.url == l.url) {
+                    links.push(l);
+                }
+            }
+            salvaged = true;
+        } else if crate::salvage::scripts_heavy(&doc) && forms.is_empty() && links.len() < 5 {
+            js_required = true;
+            let note = "*[this page requires JavaScript to render — no static content or embedded page data was recoverable]*";
+            markdown = if markdown.is_empty() {
+                note.to_string()
+            } else {
+                format!("{markdown}\n\n{note}")
+            };
+        }
+    }
+
     let content_hash = fnv1a_hex(markdown.as_bytes());
     Page {
         url: base_url.to_string(),
         title,
         byline,
         markdown,
-        links: acc.links,
+        links,
         forms,
+        salvaged,
+        js_required,
         content_hash,
     }
 }
@@ -215,7 +257,7 @@ fn extract_byline(doc: &Html) -> Option<String> {
         .or_else(|| meta_content(doc, "meta[property='article:author']"))
 }
 
-fn meta_content(doc: &Html, selector: &str) -> Option<String> {
+pub(crate) fn meta_content(doc: &Html, selector: &str) -> Option<String> {
     let s = Selector::parse(selector).ok()?;
     let el = doc.select(&s).next()?;
     let c = el.value().attr("content")?.trim().to_string();
@@ -592,7 +634,7 @@ fn ensure_blank(out: &mut String) {
 
 /// Resolve `href` against `base`, keeping only http(s). Drops fragments,
 /// `mailto:`, `javascript:`, empty.
-fn resolve(base: Option<&Url>, href: &str) -> Option<String> {
+pub(crate) fn resolve(base: Option<&Url>, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty() || href.starts_with('#') {
         return None;
@@ -822,6 +864,41 @@ mod tests {
         let p = extract(PAGE, "https://example.com/article");
         assert!(p.forms.is_empty());
         assert!(!p.markdown.contains("[form#"));
+    }
+
+    // ---- SPA salvage + honest JS signaling (Phase 14) ---------------------
+
+    #[test]
+    fn next_js_empty_shell_yields_salvaged_markdown() {
+        let html = r#"<html><head><title>Post</title></head><body><div id="__next"></div>
+            <script id="__NEXT_DATA__" type="application/json">
+            {"props":{"pageProps":{"post":{"title":"The reading cortex","slug":"reading-cortex",
+             "body":"Occipital gives an agent polite eyes on the live web and a decaying memory of what it read."}}}}
+            </script></body></html>"#;
+        let p = extract(html, "https://blog.test/p/1");
+        assert!(p.salvaged, "state blob recovered");
+        assert!(!p.js_required);
+        assert!(p.markdown.contains("polite eyes on the live web"), "{}", p.markdown);
+        assert!(p.markdown.contains("[salvaged:"), "the note names what happened: {}", p.markdown);
+    }
+
+    #[test]
+    fn client_only_page_reports_js_required_not_silence() {
+        let html = r#"<html><head><title>App</title></head><body><div id="root"></div>
+            <script src="/static/js/main.js"></script>
+            <script src="/static/js/vendor.js"></script></body></html>"#;
+        let p = extract(html, "https://app.test/");
+        assert!(p.js_required, "the honest flag");
+        assert!(!p.salvaged);
+        assert!(p.markdown.contains("requires JavaScript"), "{}", p.markdown);
+    }
+
+    #[test]
+    fn small_static_or_form_pages_are_never_flagged() {
+        let p = extract("<body><p>just a paragraph</p></body>", "https://x.test/");
+        assert!(!p.salvaged && !p.js_required, "tiny static page is just tiny");
+        let p = extract(FORM_PAGE, "https://shop.test/contact");
+        assert!(!p.js_required, "a lean form page is interactive, not a JS shell");
     }
 
     #[test]

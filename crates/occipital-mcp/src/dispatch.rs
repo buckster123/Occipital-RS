@@ -115,6 +115,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "markdown":     page.markdown,
                 "links":        page.links,
                 "forms":        page.forms,
+                "salvaged":     page.salvaged,
+                "js_required":  page.js_required,
                 "content_hash": page.content_hash,
                 "from_cache":   from_cache,
             }))
@@ -135,6 +137,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "content_hash": view.content_hash,
                 "from_cache":   view.from_cache,
                 "snapshot":     view.snapshot,
+                "salvaged":     view.salvaged,
+                "js_required":  view.js_required,
             }))
         }
         "web_click" => {
@@ -157,6 +161,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "markdown":     r.page.markdown,
                 "links":        r.page.links,
                 "forms":        r.page.forms,
+                "salvaged":     r.page.salvaged,
+                "js_required":  r.page.js_required,
                 "content_hash": r.page.content_hash,
                 "from_cache":   r.from_cache,
                 "status":       r.status,
@@ -197,6 +203,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "markdown":     r.page.markdown,
                 "links":        r.page.links,
                 "forms":        r.page.forms,
+                "salvaged":     r.page.salvaged,
+                "js_required":  r.page.js_required,
                 "content_hash": r.page.content_hash,
                 "cached":       r.cached,
             }))

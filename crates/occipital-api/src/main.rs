@@ -140,7 +140,8 @@ async fn fetch(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult 
     let (page, from_cache) = s.engine.fetch(&q.url, q.fresh).await?;
     Ok(Json(json!({
         "kind": "page", "url": page.url, "title": page.title, "markdown": page.markdown,
-        "links": page.links, "forms": page.forms, "content_hash": page.content_hash,
+        "links": page.links, "forms": page.forms, "salvaged": page.salvaged,
+        "js_required": page.js_required, "content_hash": page.content_hash,
         "from_cache": from_cache,
     })))
 }
@@ -152,6 +153,7 @@ async fn dom(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult {
         "kind": "dom", "url": view.url, "title": view.title, "links": view.links,
         "forms": view.forms, "content_hash": view.content_hash,
         "from_cache": view.from_cache, "snapshot": view.snapshot,
+        "salvaged": view.salvaged, "js_required": view.js_required,
     })))
 }
 
@@ -168,6 +170,7 @@ async fn click(State(s): State<AppState>, Json(b): Json<ClickBody>) -> ApiResult
         "kind": "click", "element": r.element, "source_url": r.source_url,
         "target_url": r.target_url, "url": r.page.url, "title": r.page.title,
         "markdown": r.page.markdown, "links": r.page.links, "forms": r.page.forms,
+        "salvaged": r.page.salvaged, "js_required": r.page.js_required,
         "content_hash": r.page.content_hash, "from_cache": r.from_cache, "status": r.status,
     })))
 }
@@ -188,7 +191,8 @@ async fn submit(State(s): State<AppState>, Json(b): Json<SubmitBody>) -> ApiResu
         "kind": "submit", "source_url": r.source_url, "form": r.form, "action": r.action,
         "method": r.method, "sent": r.sent, "status": r.status, "url": r.page.url,
         "title": r.page.title, "markdown": r.page.markdown, "links": r.page.links,
-        "forms": r.page.forms, "content_hash": r.page.content_hash, "cached": r.cached,
+        "forms": r.page.forms, "salvaged": r.page.salvaged, "js_required": r.page.js_required,
+        "content_hash": r.page.content_hash, "cached": r.cached,
     })))
 }
 

@@ -93,6 +93,12 @@ async fn main() -> anyhow::Result<()> {
             if from_cache {
                 eprintln!("[served from cache]");
             }
+            if page.salvaged {
+                eprintln!("[salvaged from embedded page data]");
+            }
+            if page.js_required {
+                eprintln!("[page requires JavaScript — nothing recoverable]");
+            }
             println!("{}", page.markdown);
         }
         Command::Dom { url } => {

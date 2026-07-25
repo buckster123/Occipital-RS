@@ -434,6 +434,8 @@ mod tests {
             markdown: "Rust 1.99 ships const generics improvements and faster builds.".into(),
             links: vec![],
             forms: vec![],
+            salvaged: false,
+            js_required: false,
             content_hash: "h1".into(),
         }
     }

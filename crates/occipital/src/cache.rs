@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS pages (
     markdown      TEXT NOT NULL,
     links         TEXT NOT NULL,            -- JSON array of {text,url}
     forms         TEXT NOT NULL DEFAULT '[]', -- JSON array of Form (Phase 12)
+    salvaged      INTEGER NOT NULL DEFAULT 0, -- content mined from embedded data (Phase 14)
+    js_required   INTEGER NOT NULL DEFAULT 0, -- client-only page, nothing recoverable
     content_hash  TEXT NOT NULL,
     etag          TEXT,
     last_modified TEXT,
@@ -140,30 +142,33 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT title, byline, markdown, links, forms, content_hash, etag, \
-                        last_modified, fetched_at, pinned FROM pages WHERE url = ?1",
+                "SELECT title, byline, markdown, links, forms, salvaged, js_required, \
+                        content_hash, etag, last_modified, fetched_at, pinned \
+                 FROM pages WHERE url = ?1",
                 params![url],
                 |r| {
                     let links_json: String = r.get(3)?;
                     let forms_json: String = r.get(4)?;
-                    let fetched_at: String = r.get(8)?;
+                    let fetched_at: String = r.get(10)?;
                     Ok((
                         r.get::<_, Option<String>>(0)?, // title
                         r.get::<_, Option<String>>(1)?, // byline
                         r.get::<_, String>(2)?,         // markdown
                         links_json,
                         forms_json,
-                        r.get::<_, String>(5)?,         // content_hash
-                        r.get::<_, Option<String>>(6)?, // etag
-                        r.get::<_, Option<String>>(7)?, // last_modified
+                        r.get::<_, i64>(5)? != 0,        // salvaged
+                        r.get::<_, i64>(6)? != 0,        // js_required
+                        r.get::<_, String>(7)?,         // content_hash
+                        r.get::<_, Option<String>>(8)?, // etag
+                        r.get::<_, Option<String>>(9)?, // last_modified
                         fetched_at,
-                        r.get::<_, i64>(9)? != 0,        // pinned
+                        r.get::<_, i64>(11)? != 0,       // pinned
                     ))
                 },
             )
             .optional()?;
 
-        let Some((title, byline, markdown, links_json, forms_json, content_hash, etag, last_modified, fetched_at, pinned)) = row
+        let Some((title, byline, markdown, links_json, forms_json, salvaged, js_required, content_hash, etag, last_modified, fetched_at, pinned)) = row
         else {
             return Ok(None);
         };
@@ -171,7 +176,17 @@ impl Cache {
         let forms: Vec<Form> = serde_json::from_str(&forms_json).unwrap_or_default();
         let fetched_at = parse_ts(&fetched_at)?;
         Ok(Some(PageRow {
-            page: Page { url: url.to_string(), title, byline, markdown, links, forms, content_hash },
+            page: Page {
+                url: url.to_string(),
+                title,
+                byline,
+                markdown,
+                links,
+                forms,
+                salvaged,
+                js_required,
+                content_hash,
+            },
             etag,
             last_modified,
             fetched_at,
@@ -195,17 +210,20 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO pages \
-               (url, title, byline, markdown, links, forms, content_hash, etag, last_modified, \
+               (url, title, byline, markdown, links, forms, salvaged, js_required, \
+                content_hash, etag, last_modified, \
                 fetched_at, last_access, access_count, salience, pinned) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,0,1.0,?11) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,0,1.0,?13) \
              ON CONFLICT(url) DO UPDATE SET \
                title=excluded.title, byline=excluded.byline, markdown=excluded.markdown, \
-               links=excluded.links, forms=excluded.forms, content_hash=excluded.content_hash, \
+               links=excluded.links, forms=excluded.forms, salvaged=excluded.salvaged, \
+               js_required=excluded.js_required, content_hash=excluded.content_hash, \
                etag=excluded.etag, last_modified=excluded.last_modified, \
                fetched_at=excluded.fetched_at, last_access=excluded.last_access, \
                pinned=excluded.pinned",
             params![
                 page.url, page.title, page.byline, page.markdown, links, forms,
+                page.salvaged as i64, page.js_required as i64,
                 page.content_hash, etag, last_modified, now, pinned as i64
             ],
         )?;
@@ -555,13 +573,20 @@ impl Cache {
 /// Additive column migrations for DBs created by earlier schema versions —
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    let has_forms: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name='forms'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_forms == 0 {
-        conn.execute("ALTER TABLE pages ADD COLUMN forms TEXT NOT NULL DEFAULT '[]'", [])?;
+    const ADDED: &[(&str, &str)] = &[
+        ("forms", "TEXT NOT NULL DEFAULT '[]'"),          // Phase 12
+        ("salvaged", "INTEGER NOT NULL DEFAULT 0"),       // Phase 14
+        ("js_required", "INTEGER NOT NULL DEFAULT 0"),    // Phase 14
+    ];
+    for (col, ddl) in ADDED {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name=?1",
+            params![col],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            conn.execute(&format!("ALTER TABLE pages ADD COLUMN {col} {ddl}"), [])?;
+        }
     }
     Ok(())
 }
@@ -601,6 +626,8 @@ mod tests {
             markdown: body.into(),
             links: vec![Link { text: "x".into(), url: "https://e.test/x".into() }],
             forms: vec![],
+            salvaged: false,
+            js_required: false,
             content_hash: "abc".into(),
         }
     }
@@ -740,6 +767,17 @@ mod tests {
         c.put_page(&p, None, None, false).unwrap();
         let row = c.get_page("https://e.test/f").unwrap().unwrap();
         assert_eq!(row.page.forms, p.forms, "forms JSON roundtrips");
+    }
+
+    #[test]
+    fn salvage_flags_roundtrip_through_the_page_store() {
+        let c = Cache::open_in_memory().unwrap();
+        let mut p = page("https://e.test/spa", "salvaged body");
+        p.salvaged = true;
+        p.js_required = false;
+        c.put_page(&p, None, None, false).unwrap();
+        let row = c.get_page("https://e.test/spa").unwrap().unwrap();
+        assert!(row.page.salvaged && !row.page.js_required, "flags survive the cache");
     }
 
     #[test]
