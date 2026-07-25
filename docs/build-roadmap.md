@@ -25,6 +25,20 @@ semantic dedup + relate/surface across pages, digests ("what did I read about X"
 the ui-slint distill card, sqlite-vec ANN for `all_embeddings()` scale,
 `ingest_file` (the file → knowledge on-ramp, lands in cerebro-mcp), freshness/re-distill.
 
+### Agent-browsing expansion (Phases 12–16) — design locked in [agent-browsing.md](agent-browsing.md)
+
+| Phase | Feature | Gate | Status |
+|-------|---------|------|--------|
+| 12 | **Interactive page model** — forms extracted (drop the `form`/`input`/`button` skip), element registry (stable ordinals), bounded `snapshots` store (TTL + GC), `web_dom` dump | fetch a form page → reader view shows annotated form blocks; `web_dom` returns the registry; snapshot resolvable after the fetch | planned |
+| 13 | **Interaction verbs** — `web_click` (link → polite GET; submit button → form submission) + `web_submit` (fill + GET/POST), POST deliberate-only & never auto-retried, follow-along `click`/`submit` kinds | live search-box round trip on a real site via `web_submit`; click-by-ordinal navigates; POST rides the same rate/robots gates | planned |
+| 14 | **SPA salvage + honest JS signaling** — thin-body detection → mine `__NEXT_DATA__`/`__NUXT__`/state blobs/`ld+json`/OpenGraph/`noscript`; `js_required: true` when even salvage fails | fixture Next.js empty-shell page yields readable markdown (`salvaged: true`); a truly client-only page returns `js_required: true`, not silence | planned |
+| 15 | **Sessions & identity** — opt-in persistent cookie jar (0600), per-domain custom headers (UA stays honest), explicit `OCCIPITAL_PROXY`; operator-provisioned auth only | a site-set cookie survives restart (opt-in) and completes a two-step flow; headers applied per-domain; proxy logged + used | planned |
+| 16 | **Politeness hygiene for multi-step** — honor `Crawl-delay`, eTLD+1 bucket keys, robots cache TTL, request log + trace payload, `--obey-robots` CLI alias | crawl-delay raises spacing (unit-tested); subdomain hop shares the site budget; `occipital log` shows the trail | planned |
+
+The **JS door** (render sidecar driving a system headless browser over CDP-as-client) is a
+contract, not a phase — see agent-browsing.md. It only exists as the `PageLoader` seam +
+`js_required` escalation trigger until a separate `occipital-render` project claims it.
+
 **Gate to move on:** the row's gate works end-to-end, clippy-clean, tested.
 
 ## Sequencing notes
@@ -56,7 +70,10 @@ the ui-slint distill card, sqlite-vec ANN for `all_embeddings()` scale,
 
 ## Out of scope (for now)
 
-- JS-rendered pages / headless browser (breaks pure-Rust + Nano; use a keyed provider instead).
-- Authenticated / paywalled content.
+- JS *execution* stays out of the core permanently; client-only pages get SPA salvage + an
+  honest `js_required` flag (Phase 13), and heavy nodes may later opt into a render sidecar —
+  see the JS-door contract in [agent-browsing.md](agent-browsing.md).
+- Authenticated content beyond operator-provisioned sessions (Phase 14); paywall/CAPTCHA
+  bypass stays out permanently.
 - Image/PDF extraction (a later "Occipital vision" slice could mirror Cerebro's `describe_image`).
 - Crawling / link-following beyond the explicit `top_n` search fetch.
