@@ -157,15 +157,18 @@ pub fn extract(html: &str, base_url: &str) -> Page {
         }
     }
 
-    // A search-looking input OUTSIDE any <form> is script-driven — the
-    // interaction verbs cannot submit it, and its absence from the form
-    // registry otherwise reads as a missing feature rather than a site
-    // reality (apex1 field report, 2026-07-26: openlibrary.org's header
-    // search). Say so honestly.
-    if has_formless_search(&doc) {
+    // A script-driven search the interaction verbs cannot submit — say so,
+    // or its absence from the form registry reads as a missing feature
+    // rather than a site reality (apex1 field reports, 2026-07-26). Two
+    // shapes: a search-looking <input> outside any <form>, and the SPA
+    // idiom apex1's verification round caught on openlibrary.org — no
+    // <input> at all, just a div/button trigger hydrated by JS, detectable
+    // only by its markup affordance (and only meaningful when the page
+    // yields zero submittable forms).
+    if has_formless_search(&doc) || (forms.is_empty() && has_search_affordance(&doc)) {
         ensure_blank(&mut out);
         out.push_str(
-            "*[a search input exists outside any form — script-driven; not submittable via the interaction verbs]*\n",
+            "*[a search affordance exists outside any form — script-driven; not submittable via the interaction verbs]*\n",
         );
     }
 
@@ -738,6 +741,31 @@ fn has_formless_search(doc: &Html) -> bool {
     })
 }
 
+/// Whether the markup carries a search AFFORDANCE without any `<input>` being
+/// involved — the modern-SPA shape (`<div class="search-bar-trigger">` and
+/// kin, hydrated by JS). `role="search"` is the accessible marker; the hint
+/// sweep catches the common class/id idioms. Hints are deliberately compound
+/// ("search-bar", not "search") so prose-ish values like "research" can't
+/// trip it.
+fn has_search_affordance(doc: &Html) -> bool {
+    if let Ok(sel) = Selector::parse(r#"[role="search"]"#) {
+        if doc.select(&sel).next().is_some() {
+            return true;
+        }
+    }
+    const HINTS: [&str; 6] = [
+        "search-bar", "searchbox", "search-box", "search-trigger", "search-form", "search-field",
+    ];
+    doc.root_element().descendants().filter_map(ElementRef::wrap).any(|el| {
+        ["class", "id", "aria-label", "data-testid"].iter().any(|a| {
+            el.value().attr(a).is_some_and(|v| {
+                let v = v.to_ascii_lowercase();
+                HINTS.iter().any(|h| v.contains(h))
+            })
+        })
+    })
+}
+
 /// FNV-1a (64-bit) as lowercase hex — a small, stable content fingerprint.
 /// (Also mints the engine's `result:<hash>` interaction handles.)
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -1014,7 +1042,7 @@ mod tests {
             <main><p>content here</p></main></body>"#;
         let p = extract(html, "https://x.test/");
         assert!(
-            p.markdown.contains("search input exists outside any form"),
+            p.markdown.contains("search affordance exists outside any form"),
             "honest note expected: {}",
             p.markdown
         );
@@ -1029,5 +1057,48 @@ mod tests {
             "in-form search is registry business, not a note: {}",
             p.markdown
         );
+    }
+
+    #[test]
+    fn div_trigger_search_on_a_formless_page_gets_the_note_too() {
+        // The SPA shape apex1's verification round caught: openlibrary.org
+        // ships ZERO <input> and ZERO <form> — the search bar is a div
+        // hydrated by JS. The input-based trigger can't fire; the affordance
+        // sweep must.
+        let html = r#"<body><header>
+            <div class="search-bar-component"><div class="search-bar-trigger">
+                <span class="search-bar-trigger__label">Search</span>
+            </div></div></header>
+            <main><p>Failed to fetch carousel. Retry?</p></main></body>"#;
+        let p = extract(html, "https://openlibrary.test/");
+        assert!(p.forms.is_empty());
+        assert!(
+            p.markdown.contains("search affordance exists outside any form"),
+            "div-trigger search must be flagged: {}",
+            p.markdown
+        );
+
+        // role="search" is the accessible marker for the same thing.
+        let html = r#"<body><div role="search"><button>Search</button></div>
+            <main><p>content</p></main></body>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(p.markdown.contains("search affordance"), "{}", p.markdown);
+
+        // But affordance-only detection stays scoped to FORMLESS pages: with
+        // a real form present the registry speaks for itself…
+        let html = r#"<body><div class="search-bar-trigger">Search</div>
+            <main><form action="/w" method="post"><input name="e"><button>Join</button></form>
+            <p>content</p></main></body>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(
+            !p.markdown.contains("search affordance exists"),
+            "a page with forms is not 'formless': {}",
+            p.markdown
+        );
+
+        // …and prose-ish attribute values ("research") never trip the hints.
+        let html = r#"<body><main><div class="research-notes"><p>content here</p></div></main></body>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(!p.markdown.contains("search affordance"), "{}", p.markdown);
     }
 }
