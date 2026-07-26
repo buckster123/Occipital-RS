@@ -234,6 +234,22 @@ suppression — the two most regression-likely cases), then filed two seams and 
   a second round of field data; vite.dev itself has no `<link>`, so the markup-only cut
   won't reach it yet.
 
+### Round five — the dead alternate, and the prober that deliberately doesn't exist
+
+- **Dead-alternate repair.** docs.deno.com advertises `href="//runtime/index.md"` — RFC 3986
+  reads that as a network-path reference (host `runtime`, DNS-dead); the site meant one
+  slash. A reported affordance must be real, so resolution now validates the host is
+  plausible (dotted, or the page's own — localhost dev pages stay fine): a `//single-label/`
+  href is re-read as root-relative against the page's origin (yielding the URL that actually
+  serves, verified 200), and an unrepairable implausible host is dropped rather than
+  reported. Legitimate cross-origin alternates (hono.dev → raw.githubusercontent.com) pass
+  untouched.
+- **The `llms.txt` prober stays unbuilt, on field evidence.** apex1's discovery tally
+  (5 sites): 4 advertise via `rel=alternate` markup, 1 by prose banner, 0 by bare
+  convention. Markup is the majority path, the banner case is legible in the reader view,
+  and per-origin probing would double requests to catch it. The tally continues; if the
+  ratio inverts, that files the feature.
+
 ## The JS door
 
 ### What a real engine buys that the trick can't
