@@ -70,6 +70,19 @@ pub struct Form {
     /// The submit control's label, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit: Option<String>,
+    /// Whether submitting this form can do anything at all. `false` for a GET
+    /// form with zero NAMED fields — it cannot carry data by construction, so
+    /// its submission is structurally a re-fetch of the action URL
+    /// (react.dev's Algolia modal-trigger forms, apex1 field report
+    /// 2026-07-26: the no-op returned the homepage as a "search result").
+    /// `web_submit` refuses such forms; this flag makes it visible in the
+    /// registry before anyone tries.
+    #[serde(default = "default_true")]
+    pub submittable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The reader-mode result for one page.
@@ -163,9 +176,12 @@ pub fn extract(html: &str, base_url: &str) -> Page {
     // shapes: a search-looking <input> outside any <form>, and the SPA
     // idiom apex1's verification round caught on openlibrary.org — no
     // <input> at all, just a div/button trigger hydrated by JS, detectable
-    // only by its markup affordance (and only meaningful when the page
-    // yields zero submittable forms).
-    if has_formless_search(&doc) || (forms.is_empty() && has_search_affordance(&doc)) {
+    // only by its markup affordance. The affordance path is suppressed only
+    // by a form that could PLAUSIBLY BE the search (a named text/search
+    // field with a searchy name or label) — "the page has forms" is not the
+    // same claim: a newsletter form (docs.pydantic.dev) or a dead modal
+    // trigger (react.dev) doesn't make a JS-only search submittable.
+    if has_formless_search(&doc) || (!has_search_form(&forms) && has_search_affordance(&doc)) {
         ensure_blank(&mut out);
         out.push_str(
             "*[a search affordance exists outside any form — script-driven; not submittable via the interaction verbs]*\n",
@@ -325,7 +341,11 @@ fn extract_forms(doc: &Html, base: Option<&Url>, page_url: &str) -> (Vec<Form>, 
         };
         let (fields, submit) = extract_fields(el, &labels);
         nodes.push(el.id());
-        forms.push(Form { idx, action, method, fields, submit });
+        // A GET form with no named fields is a structural no-op (see the
+        // `submittable` doc); an empty-field POST stays submittable — an
+        // empty POST to a distinct action can still be a server-side act.
+        let submittable = method == "post" || fields.iter().any(|f| !f.name.is_empty());
+        forms.push(Form { idx, action, method, fields, submit, submittable });
     }
     (forms, nodes)
 }
@@ -741,23 +761,59 @@ fn has_formless_search(doc: &Html) -> bool {
     })
 }
 
+/// Whether `s` contains "search" as a standalone word — attribute-scoped
+/// matching, so "Research papers" can never trip it.
+fn has_search_word(s: &str) -> bool {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| w.eq_ignore_ascii_case("search"))
+}
+
+/// Whether any form could PLAUSIBLY BE the page's search: at least one NAMED
+/// text/search field whose name or label reads searchy. This is what gates
+/// the affordance note off — "the page has forms" is not it (apex1's 6-site
+/// survey: a newsletter form or a dead modal trigger must not silence the
+/// note).
+fn has_search_form(forms: &[Form]) -> bool {
+    const SEARCHY_NAMES: [&str; 6] = ["q", "s", "query", "search", "keyword", "keywords"];
+    forms.iter().any(|f| {
+        f.fields.iter().any(|fd| {
+            !fd.name.is_empty()
+                && matches!(fd.kind.as_str(), "text" | "search")
+                && (SEARCHY_NAMES.contains(&fd.name.to_ascii_lowercase().as_str())
+                    || fd.label.as_deref().is_some_and(has_search_word))
+        })
+    })
+}
+
 /// Whether the markup carries a search AFFORDANCE without any `<input>` being
 /// involved — the modern-SPA shape (`<div class="search-bar-trigger">` and
-/// kin, hydrated by JS). `role="search"` is the accessible marker; the hint
-/// sweep catches the common class/id idioms. Hints are deliberately compound
-/// ("search-bar", not "search") so prose-ish values like "research" can't
-/// trip it.
+/// kin, hydrated by JS). Tells, per apex1's 6-site survey (2026-07-26 — the
+/// original compound-class hints matched 1/6 in the wild):
+/// - `role="search"` — the ARIA landmark;
+/// - `aria-label` containing the WORD "search" (6/6 of the survey — an
+///   accessibility requirement, not a styling choice; word-matched so
+///   "Research papers" can't trip it);
+/// - a custom-element tag ending `-search` (`<site-search>`, `<sl-doc-search>`);
+/// - compound class/id/data hints (`search-bar`, `docsearch` = Algolia
+///   DocSearch, …) — deliberately compound so prose can't false-positive.
 fn has_search_affordance(doc: &Html) -> bool {
     if let Ok(sel) = Selector::parse(r#"[role="search"]"#) {
         if doc.select(&sel).next().is_some() {
             return true;
         }
     }
-    const HINTS: [&str; 6] = [
+    const HINTS: [&str; 7] = [
         "search-bar", "searchbox", "search-box", "search-trigger", "search-form", "search-field",
+        "docsearch",
     ];
     doc.root_element().descendants().filter_map(ElementRef::wrap).any(|el| {
-        ["class", "id", "aria-label", "data-testid"].iter().any(|a| {
+        if el.value().name().ends_with("-search") {
+            return true;
+        }
+        if el.value().attr("aria-label").is_some_and(has_search_word) {
+            return true;
+        }
+        ["class", "id", "data-testid"].iter().any(|a| {
             el.value().attr(a).is_some_and(|v| {
                 let v = v.to_ascii_lowercase();
                 HINTS.iter().any(|h| v.contains(h))
@@ -1084,15 +1140,18 @@ mod tests {
         let p = extract(html, "https://x.test/");
         assert!(p.markdown.contains("search affordance"), "{}", p.markdown);
 
-        // But affordance-only detection stays scoped to FORMLESS pages: with
-        // a real form present the registry speaks for itself…
+        // A non-search form does NOT silence the note (the gate is "no
+        // submittable SEARCH form", not "no forms" — round-3 widening after
+        // the openlibrary waitlist / pydantic newsletter blind spots): the
+        // JS-only search still isn't submittable just because an unrelated
+        // form is.
         let html = r#"<body><div class="search-bar-trigger">Search</div>
             <main><form action="/w" method="post"><input name="e"><button>Join</button></form>
             <p>content</p></main></body>"#;
         let p = extract(html, "https://x.test/");
         assert!(
-            !p.markdown.contains("search affordance exists"),
-            "a page with forms is not 'formless': {}",
+            p.markdown.contains("search affordance exists"),
+            "an unrelated form must not silence the note: {}",
             p.markdown
         );
 
@@ -1100,5 +1159,70 @@ mod tests {
         let html = r#"<body><main><div class="research-notes"><p>content here</p></div></main></body>"#;
         let p = extract(html, "https://x.test/");
         assert!(!p.markdown.contains("search affordance"), "{}", p.markdown);
+    }
+
+    #[test]
+    fn survey_tells_fire_and_research_still_does_not() {
+        // apex1's 6-site survey: aria-label="Search" is the universal tell
+        // (an accessibility requirement, not a styling choice).
+        let html = r#"<body><div aria-label="Search"><button>⌕</button></div>
+            <main><p>content</p></main></body>"#;
+        assert!(extract(html, "https://x.test/").markdown.contains("search affordance"));
+
+        // Word-matched: "Research papers" can never trip it.
+        let html = r#"<body><div aria-label="Research papers">list</div>
+            <main><p>content</p></main></body>"#;
+        assert!(!extract(html, "https://x.test/").markdown.contains("search affordance"));
+
+        // Algolia DocSearch — the dominant docs-search widget.
+        let html = r#"<body><button class="DocSearch-Button">Search</button>
+            <main><p>content</p></main></body>"#;
+        assert!(extract(html, "https://x.test/").markdown.contains("search affordance"));
+
+        // Custom-element tags: <site-search> (pydantic), <sl-doc-search> (astro).
+        let html = r#"<body><site-search></site-search><main><p>content</p></main></body>"#;
+        assert!(extract(html, "https://x.test/").markdown.contains("search affordance"));
+    }
+
+    #[test]
+    fn note_gate_is_search_forms_not_any_forms() {
+        // pydantic shape: an unrelated newsletter form must not silence the
+        // note about the JS-only <site-search>.
+        let html = r#"<body><site-search></site-search><main>
+            <form action="https://cio.test/sub" method="post"><input type="email" name="email"><button>Subscribe</button></form>
+            <p>content</p></main></body>"#;
+        let p = extract(html, "https://pydantic.test/");
+        assert_eq!(p.forms.len(), 1);
+        assert!(
+            p.markdown.contains("search affordance exists outside any form"),
+            "a newsletter form is not a search form: {}",
+            p.markdown
+        );
+
+        // react shape: a DEAD search form (unnamed field) must not silence it
+        // either — its own registry entry says submittable:false.
+        let html = r#"<body><main>
+            <form action="https://react.test/"><input type="text" aria-label="Search"></form>
+            <p>content</p></main></body>"#;
+        let p = extract(html, "https://react.test/");
+        assert!(!p.forms[0].submittable);
+        assert!(
+            p.markdown.contains("search affordance exists outside any form"),
+            "a dead trigger form is not a search form: {}",
+            p.markdown
+        );
+
+        // mkdocs shape: a REAL search form (named `query` field) — registry
+        // speaks, no note, even though search-y markup abounds.
+        let html = r#"<body><main>
+            <form class="md-search__form" action="/search"><input type="text" name="query" aria-label="Search"><button>Go</button></form>
+            <p>content</p></main></body>"#;
+        let p = extract(html, "https://mkdocs.test/");
+        assert!(p.forms[0].submittable);
+        assert!(
+            !p.markdown.contains("search affordance exists"),
+            "a submittable search form silences the note: {}",
+            p.markdown
+        );
     }
 }

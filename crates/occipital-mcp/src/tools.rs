@@ -51,7 +51,7 @@ fn tool_schema(name: &str) -> Value {
         }),
         "web_dom" => json!({
             "name": "web_dom",
-            "description": "The element registry of a page: its links and forms with stable ordinals (link idx, form idx, field names) — the handles the interaction verbs address. Cache-first like web_fetch; `snapshot` reports whether the raw page is still held for ordinal resolution. Use when you need the interactive surface rather than the prose. The link list is windowed (default first 120; links_total = full count) — idx values are positions in the FULL list, so page with links_from/limit without ordinals shifting.",
+            "description": "The element registry of a page: its links and forms with stable ordinals (link idx, form idx, field names) — the handles the interaction verbs address. Cache-first like web_fetch; `snapshot` reports whether the raw page is still held for ordinal resolution. Use when you need the interactive surface rather than the prose. The link list is windowed (default first 120; links_total = full count) — idx values are positions in the FULL list, so page with links_from/limit without ordinals shifting. A form with `submittable: false` is a dead trigger (no named fields — a script-driven modal opener); web_submit refuses it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
