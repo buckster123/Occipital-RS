@@ -117,7 +117,7 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 
 ---
 
-## Tool surface (MCP) — first cut
+## Tool surface (MCP)
 
 | Tool | Purpose |
 |------|---------|
@@ -141,7 +141,7 @@ CDP-as-client) remains a documented door, not a scheduled phase.
 
 ---
 
-## Environment variables (planned)
+## Environment variables
 
 | Var | Default | Purpose |
 |-----|---------|---------|
@@ -214,7 +214,8 @@ Same as the sibling repos. Agent `FORGE` (agent_id=`"FORGE"`, ⚒) for all Cereb
 | File | Load when working on |
 |------|----------------------|
 | `docs/architecture.md` | crate graph, the cache/decay model, storage schema, integration points |
-| `docs/build-roadmap.md` | phased build order with gates (Phase 0–9) |
+| `docs/build-roadmap.md` | phased build order with gates (Phases 0–16, complete) |
 | `docs/politeness.md` | the scraping-etiquette contract — rate limits, robots, UA, backoff |
 | `docs/agent-browsing.md` | the browsing expansion (Phases 12–16) — page model, click/submit verbs, SPA salvage, sessions, the JS-door contract |
 | `docs/follow-along.md` | the agent↔UI contract — web_view events + the "go here" steer protocol |
+| `docs/development.md` | building, testing, tiers, live-gate recipes, house rules (dev-facing detail kept out of the README) |
