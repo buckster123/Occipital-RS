@@ -28,7 +28,12 @@ markdown isn't duplicated). The `kind` field selects how a UI renders it. As shi
   "results": [{"title": "…", "url": "https://…", "snippet": "…", "rank": 0}] }
 ```
 
-(The cache phases add `from_cache`/freshness to `results` too.) This mirrors how ApexOS's
+(The cache phases add `from_cache`/freshness to `results` too. The browsing phases add
+`forms`/`salvaged`/`js_required` to page-ish payloads and the `dom`/`click`/`submit` kinds;
+the 2026-07-26 field pass adds `links_total` — `links` is capped at 120 on the wire, ordinals
+stay full-list — and `handle` on POST-obtained `click`/`submit` results, the address of the
+result page for the next verb. New fields are additive: a renderer switching on `kind` and
+reading known keys keeps working unchanged.) This mirrors how ApexOS's
 `display_face` / `sketch_snapshot` tools already pass a side-channel the UI consumes directly from
 the `tool_requested` event — **no new agentd event type needed**: the UI reads the Occipital tool
 result and switches on `kind`.

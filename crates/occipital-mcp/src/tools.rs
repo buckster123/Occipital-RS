@@ -39,7 +39,7 @@ fn tool_schema(name: &str) -> Value {
         }),
         "web_fetch" => json!({
             "name": "web_fetch",
-            "description": "Fetch a single URL and return it as clean reader-mode Markdown (no nav/ads/chrome) plus its links. Cache-first with a conditional refresh; a live fetch is polite and rate-limited.",
+            "description": "Fetch a single URL and return it as clean reader-mode Markdown (no nav/ads/chrome) plus its links. Cache-first with a conditional refresh; a live fetch is polite and rate-limited. Links are capped at 120 on the wire; links_total reports the true count (use web_dom with links_from to page through the rest).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -51,23 +51,25 @@ fn tool_schema(name: &str) -> Value {
         }),
         "web_dom" => json!({
             "name": "web_dom",
-            "description": "The element registry of a page: its links and forms with stable ordinals (link idx, form idx, field names) — the handles the interaction verbs address. Cache-first like web_fetch; `snapshot` reports whether the raw page is still held for ordinal resolution. Use when you need the interactive surface rather than the prose.",
+            "description": "The element registry of a page: its links and forms with stable ordinals (link idx, form idx, field names) — the handles the interaction verbs address. Cache-first like web_fetch; `snapshot` reports whether the raw page is still held for ordinal resolution. Use when you need the interactive surface rather than the prose. The link list is windowed (default first 120; links_total = full count) — idx values are positions in the FULL list, so page with links_from/limit without ordinals shifting.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url":   { "type": "string", "description": "The page whose element registry to return" },
-                    "fresh": { "type": "boolean", "description": "Bypass the cache and force a live fetch (default: false)" }
+                    "url":        { "type": "string", "description": "The page whose element registry to return — a URL, or a result:<id> handle from a previous web_submit/web_click (the registry of that POST result)" },
+                    "fresh":      { "type": "boolean", "description": "Bypass the cache and force a live fetch (default: false; ignored for handles)" },
+                    "links_from": { "type": "integer", "description": "1-based idx to start the link window at (default: 1)" },
+                    "limit":      { "type": "integer", "description": "Max links in the window (default: 120)" }
                 },
                 "required": ["url"]
             }
         }),
         "web_click" => json!({
             "name": "web_click",
-            "description": "Click an element on a page by its registry ordinal (see web_dom). element 'link:N' follows that link as a polite GET and returns the reader-mode target page; element 'form:N' submits that form with its current values. Same politeness gates as every fetch.",
+            "description": "Click an element on a page by its registry ordinal (see web_dom). element 'link:N' follows that link as a polite GET and returns the reader-mode target page; element 'form:N' submits that form with its current values. Same politeness gates as every fetch. If the result is a POST page the response carries a `handle` (result:<id>) — pass THAT as url to keep interacting with the result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url":     { "type": "string", "description": "The page holding the element" },
+                    "url":     { "type": "string", "description": "The page holding the element — a URL, or a result:<id> handle from a previous web_submit/web_click" },
                     "element": { "type": "string", "description": "link:N or form:N — 1-based ordinals from web_dom / web_fetch" }
                 },
                 "required": ["url", "element"]
@@ -75,11 +77,11 @@ fn tool_schema(name: &str) -> Value {
         }),
         "web_submit" => json!({
             "name": "web_submit",
-            "description": "Fill and submit a form by its registry ordinal (see web_dom). fields sets named inputs; everything else keeps its current value (hidden state preserved verbatim). GET forms go through the read-through cache (a repeated identical submission costs zero live requests); POST goes live once, is never auto-retried, and its result is never cached. Robots-gated and rate-limited like every fetch.",
+            "description": "Fill and submit a form by its registry ordinal (see web_dom). fields sets named inputs; everything else keeps its current value (hidden state preserved verbatim). GET forms go through the read-through cache (a repeated identical submission costs zero live requests); POST goes live once, is never auto-retried, and its result is never cached durably — instead the response carries a `handle` (result:<id>, ~15 min working memory): pass it as url to web_dom/web_click/web_submit to act on the result page (pagination, clicking a result). Robots-gated and rate-limited like every fetch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url":    { "type": "string", "description": "The page holding the form" },
+                    "url":    { "type": "string", "description": "The page holding the form — a URL, or a result:<id> handle from a previous web_submit/web_click" },
                     "form":   { "type": "integer", "description": "The form's 1-based ordinal from web_dom" },
                     "fields": { "type": "object", "description": "Field overrides: {\"name\": \"value\", …}; a name the form lacks is an error", "additionalProperties": { "type": "string" } }
                 },
