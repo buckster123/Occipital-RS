@@ -267,6 +267,30 @@ the fetched URL (root-relative is the norm in authored docs), restoring the regi
 "markdown"|"text"` on the payload says which door the text came through (persisted,
 `src_fmt` column). HTML and undeclared types keep the extractor path unchanged.
 
+### Round seven — the arc closes
+
+apex1 drove the paved road end-to-end: the deno `.md` arrives structured (title lifted,
+25 links, fences intact), and **an `llms.txt` index is now navigable** — `web_click` off
+vite's ToC lands on `guide/why.md` through the verbatim branch, a hop that was structurally
+impossible when the registry was empty. `src_fmt` confirmed a column, not luck.
+
+- **Legacy flat rows self-heal.** Rows cached before the passthrough hold the old one-line
+  rendering with no `source_format` — silently legacy. A NULL-`src_fmt` row whose URL looks
+  markdown-ish (`.md` / `.markdown` / `.txt`) is treated as a full cache MISS on next
+  access — deliberately not a conditional refresh, since a 304 keeps the flat body (the
+  server's content didn't change; our reading did). One live GET per legacy row, once.
+  Absent `source_format` on an html-URL row stays by design (the extractor path never sets
+  it).
+- **By design, not bugs** (apex1's field notes): verbatim means embedded HTML/custom
+  elements in a `.md` ride along (`<deno-tabs>` — stripping them would be the extractor
+  sneaking back in); and the PROSE keeps the author's relative links while the REGISTRY
+  carries them resolved — the prose is the author's, the registry is the machine's, and
+  `web_click` uses the machine's.
+
+The alternates arc in full: **discovered** honestly (#14) → **repaired** when broken (#15)
+→ **readable** on arrival (#16) → **healed** in the cache (this) — four rounds, one
+coherent capability, every step driven by walking the road rather than reasoning about it.
+
 ## The JS door
 
 ### What a real engine buys that the trick can't
