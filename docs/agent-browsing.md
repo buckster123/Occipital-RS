@@ -162,6 +162,29 @@ findings (verified against this source; the write-up lives on that node). What s
   fix is a reader-view note: `[a search input exists outside any form — script-driven; not
   submittable via the interaction verbs]`.
 
+### The verification round (same day)
+
+apex1 re-ran the repros post-merge: a **three-hop POST walk** on DDG lite (hidden state
+`s=10 → s=25 → s=40` round-tripping, the fatal ordinal shift now navigable), windowing
+verified against the morning's uncapped 570-link dump, unwrapping clean on organics with
+sponsored links staying honestly wrapped. Two follow-ups from that round:
+
+- **The affordance widening.** openlibrary.org ships *zero* `<input>` — its search bar is a
+  `<div class="search-bar-trigger">` hydrated by JS, so the input-based note could never fire
+  on the page that motivated it. The trigger now also fires when a page yields **zero
+  submittable forms** but its markup carries a search affordance (`role="search"`, or a
+  class/id/aria/data hint like `search-bar`/`searchbox`/`search-trigger` — compound hints
+  only, so "research" can't trip it). Wording: "*a search affordance exists outside any
+  form*".
+- **`from_handle` audit echo.** Every hop of a POST walk shares the same `final_url`, so
+  `source_url` made three hops read as identical submits. A handle-sourced `web_click`/
+  `web_submit` now echoes the input handle as `from_handle` — the chain self-documents.
+
+Parked from that round: `js_required` stays false on hydration-failure pages with enough
+residual links (the affordance note now carries the "don't bother with the verbs here"
+signal); Bing `aclick` unwrapping (base64 blob, sponsored-only — verified a non-issue in the
+field).
+
 ## The JS door
 
 ### What a real engine buys that the trick can't

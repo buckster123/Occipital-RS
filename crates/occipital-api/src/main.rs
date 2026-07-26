@@ -177,6 +177,9 @@ async fn click(State(s): State<AppState>, Json(b): Json<ClickBody>) -> ApiResult
     if let Some(h) = &r.handle {
         out["handle"] = json!(h);
     }
+    if b.url.starts_with("result:") {
+        out["from_handle"] = json!(b.url);
+    }
     Ok(Json(out))
 }
 
@@ -201,6 +204,9 @@ async fn submit(State(s): State<AppState>, Json(b): Json<SubmitBody>) -> ApiResu
     });
     if let Some(h) = &r.handle {
         out["handle"] = json!(h);
+    }
+    if b.url.starts_with("result:") {
+        out["from_handle"] = json!(b.url);
     }
     Ok(Json(out))
 }

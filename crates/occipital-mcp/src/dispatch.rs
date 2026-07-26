@@ -201,6 +201,13 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             if let Some(h) = &r.handle {
                 out["handle"] = json!(h);
             }
+            // Echo which hop this came from: source_url alone can't tell
+            // (every hop of a POST walk shares the same final_url), so a
+            // multi-hop transcript would read as three identical clicks
+            // (apex1 verification round, 2026-07-26).
+            if url.starts_with("result:") {
+                out["from_handle"] = json!(url);
+            }
             Ok(out)
         }
         "web_submit" => {
@@ -249,6 +256,12 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             // memory handle so pagination is discoverable without docs.
             if let Some(h) = &r.handle {
                 out["handle"] = json!(h);
+            }
+            // Which hop was this? source_url is identical across a POST walk
+            // (same final_url every time) — echo the input handle so the
+            // transcript self-documents the chain.
+            if url.starts_with("result:") {
+                out["from_handle"] = json!(url);
             }
             Ok(out)
         }
@@ -326,6 +339,9 @@ mod tests {
                 body:          self.0.clone(),
                 source:        Source::Network,
             })
+        }
+        async fn request(&self, req: occipital::fetch::HttpRequest) -> anyhow::Result<FetchResponse> {
+            self.get(&req.url).await
         }
     }
 
@@ -509,6 +525,38 @@ mod tests {
         assert_eq!(out["links"][0]["idx"], 121);
         assert_eq!(out["links"][0]["url"], "https://portal.test/p121");
         assert_eq!(out["links_total"], 150);
+    }
+
+    #[tokio::test]
+    async fn handle_hops_echo_from_handle_for_the_audit_trail() {
+        // Every hop of a POST walk shares the same final_url, so source_url
+        // alone reads as three identical submits — the echoed input handle is
+        // what makes the chain self-documenting.
+        let html = r#"<html><body><main>
+            <form action="/page" method="post">
+              <input type="hidden" name="page" value="2"><button>Next</button>
+            </form></main></body></html>"#;
+        let msg = json!({"jsonrpc":"2.0","id":20,"method":"tools/call",
+            "params":{"name":"web_submit","arguments":{"url":"https://walk.test/","form":1}}});
+        let resp = dispatch_tool(msg, engine_with(html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(out["handle"].as_str().is_some(), "POST result mints a handle");
+        assert!(out.get("from_handle").is_none(), "hop 1 came from a URL, not a handle");
+
+        // Hop 2 THROUGH the handle: the same engine must be reused (the
+        // result store is in-memory), and the input handle must be echoed.
+        let engine = engine_with(html);
+        let msg = json!({"jsonrpc":"2.0","id":21,"method":"tools/call",
+            "params":{"name":"web_submit","arguments":{"url":"https://walk.test/","form":1}}});
+        let resp = dispatch_tool(msg, Arc::clone(&engine)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let handle = out["handle"].as_str().unwrap().to_string();
+        let msg = json!({"jsonrpc":"2.0","id":22,"method":"tools/call",
+            "params":{"name":"web_submit","arguments":{"url":handle,"form":1}}});
+        let resp = dispatch_tool(msg, engine).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["from_handle"].as_str(), Some(handle.as_str()), "the hop chain is auditable");
+        assert!(out["handle"].as_str().is_some(), "…and the walk can continue");
     }
 
     #[tokio::test]
