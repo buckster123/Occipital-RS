@@ -395,7 +395,22 @@ impl Engine {
             None => None,
         };
 
-        if !fresh {
+        // Self-heal rows flattened before the verbatim branch existed: a
+        // NULL-src_fmt row for a URL that would take that branch today holds
+        // the OLD one-line rendering (title lost, link graph lost). It must
+        // be a full MISS, not a conditional refresh — a 304 would keep the
+        // flat body, because the SERVER's content didn't change; our reading
+        // of it did (apex1 round-seven residual, 2026-07-26). One live GET
+        // per legacy row, once, on next access.
+        let legacy_flat = existing.as_ref().is_some_and(|row| {
+            row.page.source_format.is_none() && {
+                let lower = url.to_ascii_lowercase();
+                let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+                path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".txt")
+            }
+        });
+
+        if !fresh && !legacy_flat {
             if let Some(row) = &existing {
                 if self.is_fresh(row.fetched_at) {
                     if let Some(c) = &self.cache {
@@ -1344,6 +1359,52 @@ mod tests {
         assert!(c2, "second read is the cache");
         assert_eq!(p2.source_format.as_deref(), Some("markdown"), "provenance survives the cache");
         assert_eq!(p2.markdown, p1.markdown);
+    }
+
+    #[tokio::test]
+    async fn legacy_flat_md_rows_self_heal_on_next_access() {
+        let md = "# Title\n\n- [one](/one/)\n";
+        let f = Counting::with_content_type(md, "text/markdown");
+        let cache = Arc::new(Cache::open_in_memory().unwrap());
+        // A pre-passthrough row: the flattened one-line rendering, no
+        // source_format — the "silently legacy" residual.
+        let flat = Page {
+            url: "https://docs.test/index.md".into(),
+            title: None,
+            byline: None,
+            markdown: "# Title - one".into(),
+            links: vec![],
+            forms: vec![],
+            salvaged: false,
+            js_required: false,
+            content_hash: "old".into(),
+            markdown_alternate: None,
+            source_format: None,
+        };
+        cache.put_page(&flat, None, None, false).unwrap();
+        let e = Engine::with_parts(f.clone(), Box::new(DuckDuckGo), Some(cache.clone()), 5, 3600);
+
+        // Within TTL, yet the flat row is a MISS and re-read live — one full
+        // GET, deliberately not conditional (a 304 would keep the flat body).
+        let (p, from_cache) = e.fetch("https://docs.test/index.md", false).await.unwrap();
+        assert!(!from_cache, "legacy flat row must not serve from cache");
+        assert_eq!(f.calls(), 1, "exactly one live GET heals it");
+        assert_eq!(p.source_format.as_deref(), Some("markdown"));
+        assert!(p.markdown.contains("\n\n- [one]"), "structure restored: {}", p.markdown);
+
+        // Healed: the next read is a normal cache hit, no further network.
+        let (p2, c2) = e.fetch("https://docs.test/index.md", false).await.unwrap();
+        assert!(c2);
+        assert_eq!(f.calls(), 1);
+        assert_eq!(p2.source_format.as_deref(), Some("markdown"), "provenance persisted");
+
+        // An html-URL row with absent source_format is BY DESIGN (the
+        // extractor path never sets it) — normal cache behaviour, untouched.
+        let html_row = Page { url: "https://docs.test/page".into(), ..flat.clone() };
+        cache.put_page(&html_row, None, None, false).unwrap();
+        let (_p3, c3) = e.fetch("https://docs.test/page", false).await.unwrap();
+        assert!(c3, "html rows are not suspects");
+        assert_eq!(f.calls(), 1, "no heal fetch for them");
     }
 
     // ---- dom + snapshots (Phase 12) --------------------------------------
