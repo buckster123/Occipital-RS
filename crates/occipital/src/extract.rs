@@ -157,6 +157,18 @@ pub fn extract(html: &str, base_url: &str) -> Page {
         }
     }
 
+    // A search-looking input OUTSIDE any <form> is script-driven — the
+    // interaction verbs cannot submit it, and its absence from the form
+    // registry otherwise reads as a missing feature rather than a site
+    // reality (apex1 field report, 2026-07-26: openlibrary.org's header
+    // search). Say so honestly.
+    if has_formless_search(&doc) {
+        ensure_blank(&mut out);
+        out.push_str(
+            "*[a search input exists outside any form — script-driven; not submittable via the interaction verbs]*\n",
+        );
+    }
+
     let mut markdown = normalize(&out);
     let mut links = acc.links;
     let mut salvaged = false;
@@ -189,6 +201,16 @@ pub fn extract(html: &str, base_url: &str) -> Page {
             } else {
                 format!("{markdown}\n\n{note}")
             };
+        }
+    }
+
+    // Unwrap known redirector links (tracking hops) AFTER the salvage merge,
+    // so mined links get the same hygiene as rendered ones — otherwise the
+    // same site yields clean or wrapped hrefs depending on which path found
+    // them (apex1 field report, 2026-07-26).
+    for l in &mut links {
+        if let Some(real) = unwrap_redirect(&l.url) {
+            l.url = real;
         }
     }
 
@@ -669,8 +691,56 @@ fn normalize(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// Known redirectors wrap a result's real destination in a query parameter (a
+/// tracking hop) — a `web_click` on such a link chains into the tracker, and
+/// the same site yields different link hygiene depending on whether the
+/// search-provider path (which unwraps) or the page-extraction path (which
+/// didn't) found it. Deliberately conservative: only hosts we know, only
+/// parameters whose value is itself a full http(s) URL — anything else is
+/// left exactly as the page wrote it. (Bing's `aclick` stays out: its `u`
+/// parameter is base64-wrapped, not a URL.)
+fn unwrap_redirect(href: &str) -> Option<String> {
+    let u = Url::parse(href).ok()?;
+    let host = u.host_str()?;
+    let param = if host.ends_with("duckduckgo.com") && u.path().contains("/l/") {
+        "uddg"
+    } else if (host == "google.com" || host.ends_with(".google.com")) && u.path() == "/url" {
+        "q"
+    } else if host == "out.reddit.com" {
+        "url"
+    } else {
+        return None;
+    };
+    let dest = u
+        .query_pairs()
+        .find(|(k, _)| k == param)
+        .or_else(|| {
+            // Google uses `q` or `url` depending on the surface.
+            (param == "q").then(|| u.query_pairs().find(|(k, _)| k == "url")).flatten()
+        })
+        .map(|(_, v)| v.into_owned())?;
+    let parsed = Url::parse(&dest).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+/// Whether the document carries a search-looking input that is NOT inside any
+/// `<form>` — a script-driven search box the interaction verbs cannot submit.
+fn has_formless_search(doc: &Html) -> bool {
+    let Ok(sel) = Selector::parse(
+        r#"input[type="search"], input[name="q"], input[name="query"], input[name="search"]"#,
+    ) else {
+        return false;
+    };
+    doc.select(&sel).any(|el| {
+        !el.ancestors()
+            .filter_map(ElementRef::wrap)
+            .any(|a| a.value().name() == "form")
+    })
+}
+
 /// FNV-1a (64-bit) as lowercase hex — a small, stable content fingerprint.
-fn fnv1a_hex(bytes: &[u8]) -> String {
+/// (Also mints the engine's `result:<hash>` interaction handles.)
+pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         hash ^= b as u64;
@@ -909,6 +979,54 @@ mod tests {
         assert!(
             p.markdown.contains("[form#1 → POST https://other.test/subscribe —"),
             "foreign action stays absolute: {}",
+            p.markdown
+        );
+    }
+
+    #[test]
+    fn known_redirector_links_unwrap_to_their_destination() {
+        // Same hygiene regardless of which verb found the link — the field
+        // observation was DDG /l/?uddg= wrappers surviving the page path
+        // while the provider path unwrapped them.
+        let html = r#"<main><p>
+            <a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&rut=abc">wrapped</a>
+            <a href="https://www.google.com/url?q=https://example.org/page&sa=U">gwrapped</a>
+            <a href="https://example.net/plain">plain</a>
+            <a href="https://duckduckgo.com/about">ddg but not a redirect</a>
+        </p></main>"#;
+        let p = extract(html, "https://serp.test/");
+        let urls: Vec<&str> = p.links.iter().map(|l| l.url.as_str()).collect();
+        assert!(urls.contains(&"https://example.com/docs"), "{urls:?}");
+        assert!(urls.contains(&"https://example.org/page"), "{urls:?}");
+        assert!(urls.contains(&"https://example.net/plain"), "{urls:?}");
+        assert!(
+            urls.contains(&"https://duckduckgo.com/about"),
+            "non-redirect paths on a redirector host stay untouched: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn formless_search_input_gets_an_honest_note() {
+        // A script-driven search box (input outside any <form>) cannot be
+        // submitted by the verbs — say so, or its absence from the registry
+        // reads as a missing feature (openlibrary.org field report).
+        let html = r#"<body><header><input type="search" placeholder="Search"></header>
+            <main><p>content here</p></main></body>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(
+            p.markdown.contains("search input exists outside any form"),
+            "honest note expected: {}",
+            p.markdown
+        );
+        assert!(p.forms.is_empty(), "nothing submittable was invented");
+
+        // The same input INSIDE a form is submittable — no note.
+        let html = r#"<body><main><form action="/s"><input type="search" name="q"></form>
+            <p>content</p></main></body>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(
+            !p.markdown.contains("outside any form"),
+            "in-form search is registry business, not a note: {}",
             p.markdown
         );
     }

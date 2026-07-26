@@ -77,6 +77,20 @@ pub async fn dispatch_tool(msg: Value, engine: Arc<Engine>) -> Value {
     }
 }
 
+/// Wire cap for a page's link list. One exploratory `web_dom` on a portal
+/// page returned 570 links of mostly interlanguage chrome (apex1 field
+/// report, 2026-07-26) — more context than the page is worth. The cap is a
+/// VIEW: the full list stays in the page cache, ordinals are positions in the
+/// full list (so the entries that survive keep their meaning), and
+/// `links_total` reports the true count so truncation is visible. `web_dom`
+/// pages through the rest via `links_from`/`limit`.
+const LINK_CAP: usize = 120;
+
+fn capped_links<T: serde::Serialize>(links: &[T]) -> (Value, usize) {
+    let total = links.len();
+    (json!(links[..total.min(LINK_CAP)]), total)
+}
+
 /// The tool router. `web_search` + `web_fetch` are live; the cache-backed tools
 /// (`web_recall` / `web_save` / `web_forget`) return an honest not-implemented
 /// error (NOT a success stub) until the cache phases; unknown tools error too.
@@ -108,12 +122,14 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
             let fresh = args["fresh"].as_bool().unwrap_or(false);
             let (page, from_cache) = engine.fetch(url, fresh).await?;
+            let (links, links_total) = capped_links(&page.links);
             Ok(json!({
                 "kind":         "page",
                 "url":          page.url,
                 "title":        page.title,
                 "markdown":     page.markdown,
-                "links":        page.links,
+                "links":        links,
+                "links_total":  links_total,
                 "forms":        page.forms,
                 "salvaged":     page.salvaged,
                 "js_required":  page.js_required,
@@ -128,18 +144,29 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
             let fresh = args["fresh"].as_bool().unwrap_or(false);
             let view = engine.dom(url, fresh).await?;
-            Ok(json!({
+            // The registry window: ordinals (`idx`) are stable against the
+            // FULL list — the window is a view, never a re-index.
+            let from = args["links_from"].as_u64().unwrap_or(1).max(1) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(LINK_CAP as u64) as usize;
+            let links_total = view.links.len();
+            let window: Vec<_> = view.links.iter().skip(from - 1).take(limit).collect();
+            let mut out = json!({
                 "kind":         "dom",
                 "url":          view.url,
                 "title":        view.title,
-                "links":        view.links,
+                "links":        window,
+                "links_total":  links_total,
                 "forms":        view.forms,
                 "content_hash": view.content_hash,
                 "from_cache":   view.from_cache,
                 "snapshot":     view.snapshot,
                 "salvaged":     view.salvaged,
                 "js_required":  view.js_required,
-            }))
+            });
+            if url.starts_with("result:") {
+                out["handle"] = json!(url);
+            }
+            Ok(out)
         }
         "web_click" => {
             let url = args["url"]
@@ -151,7 +178,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("element (link:N or form:N) required"))?;
             let r = engine.click(url, element).await?;
-            Ok(json!({
+            let (links, links_total) = capped_links(&r.page.links);
+            let mut out = json!({
                 "kind":         "click",
                 "element":      r.element,
                 "source_url":   r.source_url,
@@ -159,14 +187,21 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "url":          r.page.url,
                 "title":        r.page.title,
                 "markdown":     r.page.markdown,
-                "links":        r.page.links,
+                "links":        links,
+                "links_total":  links_total,
                 "forms":        r.page.forms,
                 "salvaged":     r.page.salvaged,
                 "js_required":  r.page.js_required,
                 "content_hash": r.page.content_hash,
                 "from_cache":   r.from_cache,
                 "status":       r.status,
-            }))
+            });
+            // A POST result is not addressable by URL — surface its working-
+            // memory handle so the next verb can act on THIS page.
+            if let Some(h) = &r.handle {
+                out["handle"] = json!(h);
+            }
+            Ok(out)
         }
         "web_submit" => {
             let url = args["url"]
@@ -190,7 +225,8 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 })
                 .unwrap_or_default();
             let r = engine.submit(url, form, &fields).await?;
-            Ok(json!({
+            let (links, links_total) = capped_links(&r.page.links);
+            let mut out = json!({
                 "kind":         "submit",
                 "source_url":   r.source_url,
                 "form":         r.form,
@@ -201,13 +237,20 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "url":          r.page.url,
                 "title":        r.page.title,
                 "markdown":     r.page.markdown,
-                "links":        r.page.links,
+                "links":        links,
+                "links_total":  links_total,
                 "forms":        r.page.forms,
                 "salvaged":     r.page.salvaged,
                 "js_required":  r.page.js_required,
                 "content_hash": r.page.content_hash,
                 "cached":       r.cached,
-            }))
+            });
+            // A POST result is not addressable by URL — surface its working-
+            // memory handle so pagination is discoverable without docs.
+            if let Some(h) = &r.handle {
+                out["handle"] = json!(h);
+            }
+            Ok(out)
         }
         "web_save" => {
             let url = args["url"]
@@ -433,5 +476,50 @@ mod tests {
             "params":{"name":"definitely_not_a_tool","arguments":{}}});
         let resp = dispatch_tool(msg, engine_with("")).await;
         assert!(resp["error"]["message"].as_str().unwrap().contains("not found"));
+    }
+
+    fn portal_html(n: usize) -> String {
+        let links: String = (1..=n)
+            .map(|i| format!(r#"<a href="/p{i}">link {i}</a> "#))
+            .collect();
+        format!("<html><head><title>Portal</title></head><body><main><p>{links}</p></main></body></html>")
+    }
+
+    #[tokio::test]
+    async fn dom_link_window_caps_with_stable_full_list_ordinals() {
+        let html = portal_html(150);
+
+        // Default window: first LINK_CAP links, true total reported.
+        let msg = json!({"jsonrpc":"2.0","id":10,"method":"tools/call",
+            "params":{"name":"web_dom","arguments":{"url":"https://portal.test/"}}});
+        let resp = dispatch_tool(msg, engine_with(&html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["links_total"], 150, "truncation must be visible");
+        assert_eq!(out["links"].as_array().unwrap().len(), LINK_CAP);
+        assert_eq!(out["links"][0]["idx"], 1);
+
+        // A window into the tail: ordinals are FULL-list positions — the
+        // window is a view, never a re-index (else link:N silently changes
+        // meaning between calls).
+        let msg = json!({"jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params":{"name":"web_dom","arguments":{"url":"https://portal.test/","links_from":121,"limit":10}}});
+        let resp = dispatch_tool(msg, engine_with(&html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["links"].as_array().unwrap().len(), 10);
+        assert_eq!(out["links"][0]["idx"], 121);
+        assert_eq!(out["links"][0]["url"], "https://portal.test/p121");
+        assert_eq!(out["links_total"], 150);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_caps_links_and_reports_the_total() {
+        let html = portal_html(150);
+        let msg = json!({"jsonrpc":"2.0","id":12,"method":"tools/call",
+            "params":{"name":"web_fetch","arguments":{"url":"https://portal.test/"}}});
+        let resp = dispatch_tool(msg, engine_with(&html)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["links_total"], 150);
+        assert_eq!(out["links"].as_array().unwrap().len(), LINK_CAP,
+            "one portal page must not dump 570 links into the context");
     }
 }

@@ -86,6 +86,8 @@ Rules that keep this polite and safe:
   concurrency as reads.
 - **Follow-along shows hands, not just eyes.** New `kind` payloads (`"click"`, `"submit"`)
   so the ApexOS window renders "agent typed *rust politeness* into search and submitted".
+- **POST results are addressable.** A POST result carries a `handle` (`result:<hash>`) usable
+  as the `url` of the next verb — see *The field pass* below.
 
 ## SPA salvage + honest JS signaling (Phase 14)
 
@@ -131,6 +133,34 @@ Gaps that matter more once sessions span many requests — all already flagged i
   `occipital log` + a follow-along trace payload. This is "network interception" done honestly:
   we own the network layer, so observability is a feature, not a hack.
 - **`--obey-robots`** CLI alias for `OCCIPITAL_RESPECT_ROBOTS` (default stays *on*).
+
+## The field pass (2026-07-26) — first live smoke, four findings
+
+apex1 drove the verbs against live search sites hours after they deployed and filed four
+findings (verified against this source; the write-up lives on that node). What shipped:
+
+- **Result handles (the structural one).** A POST result was unaddressable — `click`/`submit`
+  resolve ordinals via the *source* URL, and the POST result is deliberately never cached — so
+  interaction depth capped at one hop (a POST-paginated SERP was walkable to page 2 and no
+  further). Fix: the engine keeps a small in-memory **result store** (16 entries, ~15 min TTL,
+  gone on restart — working memory, not knowledge); a POST result mints an opaque
+  `result:<hash>` **handle**, returned in the report, accepted as the `url` of any verb. The
+  durable cache's "POST is never cached" invariant is untouched, and the source URL's registry
+  is never overwritten (the naive `final_url` keying would have collided with the landing page).
+- **Link-list cap on the wire.** One `web_dom` on a portal page returned 570 links (400+
+  interlanguage). The MCP layer now windows links (default first 120) with `links_total`
+  always reporting the true count; `web_dom` pages via `links_from`/`limit`. Ordinals are
+  positions in the FULL list — the window is a view, never a re-index.
+- **Redirector unwrapping moved down to extraction.** Only the search-provider path unwrapped
+  DDG's `/l/?uddg=` wrappers, so the same site yielded clean or wrapped hrefs depending on the
+  verb that reached it. `extract()` now unwraps known redirectors (DDG `uddg`, Google `/url`
+  `q`/`url`, `out.reddit.com` `url`) for every link, conservatively: known host + a parameter
+  that is itself a full http(s) URL, nothing else touched (Bing's base64 `aclick` stays out).
+- **Formless-search honesty.** A search-looking `<input>` outside any `<form>` (openlibrary.org's
+  header box) is script-driven and cannot be submitted — form *collection* was already
+  document-wide (the finding's hypothesized `select_main` scoping wasn't the cause), so the
+  fix is a reader-view note: `[a search input exists outside any form — script-driven; not
+  submittable via the interaction verbs]`.
 
 ## The JS door
 

@@ -149,6 +149,11 @@ pub struct ClickReport {
     /// HTTP status of a POST-form click (`None` for the read-through paths,
     /// where status is absorbed by the fetch pipeline).
     pub status:     Option<u16>,
+    /// Set when the result page is NOT addressable by URL (a POST result):
+    /// pass it as the `url` of the next `web_dom`/`web_click`/`web_submit`
+    /// to resolve ordinals against THIS page. See [`ResultStore`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle:     Option<String>,
 }
 
 /// The outcome of `web_submit`: what was sent, where, and the resulting page.
@@ -166,6 +171,49 @@ pub struct SubmitReport {
     /// GET results cache like any page; a POST result is **never** cached (the
     /// URL alone cannot reproduce it).
     pub cached:     bool,
+    /// Set when the result page is NOT addressable by URL (a POST result) —
+    /// the ordinal-resolution handle for the next verb. See [`ResultStore`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle:     Option<String>,
+}
+
+/// A POST result is deliberately never in the durable page cache (the URL
+/// alone cannot reproduce it) — but without SOME address, its ordinals are
+/// unresolvable and interaction depth caps at a single POST hop (apex1 field
+/// report, 2026-07-26: a POST-paginated SERP was walkable to page 2 and no
+/// further). This store is the middle ground: **working memory, not
+/// knowledge** — the last few interaction results, held in memory only under
+/// an opaque `result:<hash>` handle, bounded and TTL'd, gone on restart. The
+/// durable cache's "POST is never cached" invariant stands untouched.
+const RESULT_STORE_CAP: usize = 16;
+const RESULT_TTL_SECS: u64 = 900; // a browsing session, not knowledge
+
+#[derive(Default)]
+struct ResultStore {
+    /// Insertion-ordered (oldest first); tiny, linear scans are fine.
+    entries: Vec<(String, StoredResult)>,
+}
+
+struct StoredResult {
+    page: Page,
+    at:   std::time::Instant,
+}
+
+impl ResultStore {
+    fn put(&mut self, handle: String, page: Page) {
+        self.entries.retain(|(h, r)| h != &handle && r.at.elapsed().as_secs() < RESULT_TTL_SECS);
+        self.entries.push((handle, StoredResult { page, at: std::time::Instant::now() }));
+        while self.entries.len() > RESULT_STORE_CAP {
+            self.entries.remove(0);
+        }
+    }
+
+    fn get(&self, handle: &str) -> Option<Page> {
+        self.entries
+            .iter()
+            .find(|(h, r)| h == handle && r.at.elapsed().as_secs() < RESULT_TTL_SECS)
+            .map(|(_, r)| r.page.clone())
+    }
 }
 
 pub struct Engine {
@@ -185,6 +233,8 @@ pub struct Engine {
     gc_min_salience:    f32,
     gc_min_age_secs:    u64,
     snapshot_ttl_secs:  u64,
+    /// In-memory POST-result pages, keyed by `result:<hash>` handle.
+    results:            std::sync::Mutex<ResultStore>,
 }
 
 impl Engine {
@@ -218,6 +268,7 @@ impl Engine {
             gc_min_salience: cfg.gc_min_salience,
             gc_min_age_secs: cfg.gc_min_age_secs,
             snapshot_ttl_secs: cfg.snapshot_ttl_secs,
+            results: std::sync::Mutex::new(ResultStore::default()),
         })
     }
 
@@ -246,6 +297,7 @@ impl Engine {
             gc_min_salience: DEFAULT_GC_MIN_SALIENCE,
             gc_min_age_secs: DEFAULT_GC_MIN_AGE_SECS,
             snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
+            results: std::sync::Mutex::new(ResultStore::default()),
         }
     }
 
@@ -392,8 +444,39 @@ impl Engine {
     /// and stored); `snapshot` reports whether a raw-HTML snapshot is held and
     /// inside its TTL — i.e. whether an interaction verb could resolve these
     /// ordinals without a re-fetch.
+    /// Resolve the SOURCE page an interaction addresses: a `result:<hash>`
+    /// handle looks up the in-memory result store (no network, ever); anything
+    /// else goes through the normal cache-first `fetch`. The `bool` mirrors
+    /// `fetch`'s from_cache (a handle hit reports `true` — zero live requests).
+    async fn resolve_source(&self, url: &str) -> anyhow::Result<(Page, bool)> {
+        if url.starts_with("result:") {
+            let page = self.results.lock().expect("result store lock").get(url);
+            return page.map(|p| (p, true)).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown or expired result handle {url} — interaction results live \
+                     ~{} min in working memory; re-run the web_submit/web_click that \
+                     produced it, or browse via a GET URL (addressable + cached)",
+                    RESULT_TTL_SECS / 60
+                )
+            });
+        }
+        self.fetch(url, false).await
+    }
+
+    /// Store a POST-obtained page in the result store and mint its handle.
+    fn store_result(&self, source_url: &str, form_idx: usize, page: &Page) -> String {
+        let key = format!("{source_url}|{form_idx}|{}", page.content_hash);
+        let handle = format!("result:{}", crate::extract::fnv1a_hex(key.as_bytes()));
+        self.results.lock().expect("result store lock").put(handle.clone(), page.clone());
+        handle
+    }
+
     pub async fn dom(&self, url: &str, fresh: bool) -> anyhow::Result<DomView> {
-        let (page, from_cache) = self.fetch(url, fresh).await?;
+        let (page, from_cache) = if url.starts_with("result:") {
+            self.resolve_source(url).await?
+        } else {
+            self.fetch(url, fresh).await?
+        };
         let snapshot = self.snapshot_fresh(&page.url)?;
         Ok(DomView {
             links: page
@@ -421,7 +504,7 @@ impl Engine {
     pub async fn click(&self, url: &str, element: &str) -> anyhow::Result<ClickReport> {
         match parse_element(element)? {
             ElementSel::Link(n) => {
-                let (page, _) = self.fetch(url, false).await?;
+                let (page, _) = self.resolve_source(url).await?;
                 let link = page.links.get(n - 1).ok_or_else(|| {
                     anyhow::anyhow!("no link #{n} on {} ({} links in the registry — see web_dom)", page.url, page.links.len())
                 })?;
@@ -433,6 +516,7 @@ impl Engine {
                     page: target,
                     from_cache,
                     status: None,
+                    handle: None, // a followed link is a GET — addressable by its URL
                 })
             }
             ElementSel::Form(n) => {
@@ -444,6 +528,7 @@ impl Engine {
                     page: report.page,
                     from_cache: report.cached,
                     status: report.status,
+                    handle: report.handle,
                 })
             }
         }
@@ -462,7 +547,7 @@ impl Engine {
         form_idx: usize,
         overrides: &[(String, String)],
     ) -> anyhow::Result<SubmitReport> {
-        let (page, _) = self.fetch(url, false).await?;
+        let (page, _) = self.resolve_source(url).await?;
         let form = page.forms.iter().find(|f| f.idx == form_idx).ok_or_else(|| {
             anyhow::anyhow!("no form #{form_idx} on {} ({} forms in the registry — see web_dom)", page.url, page.forms.len())
         })?;
@@ -515,6 +600,11 @@ impl Engine {
                 .finish();
             let resp = self.fetcher.request(HttpRequest::post_form(&action, body.into_bytes())).await?;
             let result = extract_bytes(&resp.body, &resp.final_url);
+            // The result stays out of the durable cache (a POST is not
+            // reproducible from its URL) but goes into the in-memory result
+            // store, so the NEXT verb can address its ordinals via the handle
+            // — without it, interaction depth caps at one POST hop.
+            let handle = self.store_result(&page.url, form_idx, &result);
             Ok(SubmitReport {
                 source_url: page.url,
                 form: form_idx,
@@ -524,6 +614,7 @@ impl Engine {
                 status: Some(resp.status),
                 page: result,
                 cached: false,
+                handle: Some(handle),
             })
         } else {
             // Per the HTML spec a GET submission replaces the action's query
@@ -546,6 +637,7 @@ impl Engine {
                 status: None,
                 page: result,
                 cached: from_cache,
+                handle: None, // GET results are addressable + cached by URL
             })
         }
     }
@@ -955,6 +1047,8 @@ mod tests {
     /// assertions for the interaction verbs.
     struct Recording {
         body: Vec<u8>,
+        /// Body served for POST `request`s (defaults to `body`).
+        post_body: Vec<u8>,
         gets: std::sync::Mutex<Vec<String>>,
         reqs: std::sync::Mutex<Vec<HttpRequest>>,
     }
@@ -962,6 +1056,17 @@ mod tests {
         fn new(body: &str) -> Arc<Self> {
             Arc::new(Self {
                 body: body.as_bytes().to_vec(),
+                post_body: body.as_bytes().to_vec(),
+                gets: std::sync::Mutex::new(Vec::new()),
+                reqs: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        /// GETs serve `body`; POSTs serve `post_body` — a real interaction
+        /// lands on a page that differs from its source.
+        fn with_post_body(body: &str, post_body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                body: body.as_bytes().to_vec(),
+                post_body: post_body.as_bytes().to_vec(),
                 gets: std::sync::Mutex::new(Vec::new()),
                 reqs: std::sync::Mutex::new(Vec::new()),
             })
@@ -988,7 +1093,7 @@ mod tests {
             self.reqs.lock().unwrap().push(req);
             Ok(FetchResponse {
                 final_url: url, status: 200, content_type: None,
-                etag: None, last_modified: None, body: self.body.clone(),
+                etag: None, last_modified: None, body: self.post_body.clone(),
                 source: Source::Network,
             })
         }
@@ -1110,6 +1215,59 @@ mod tests {
         assert_eq!(report.status, Some(200));
         let body = String::from_utf8(f.reqs()[0].body.clone().unwrap()).unwrap();
         assert_eq!(body, "csrf=tok123&user=andre&pw=", "current values, hidden verbatim");
+    }
+
+    /// A POST-result SERP: 3 result links + Previous/Next POST pagination
+    /// forms — the shape that capped interaction depth at one hop in the
+    /// field (apex1, 2026-07-26).
+    const RESULT_HTML: &str = r#"<html><head><title>R</title></head><body><main>
+        <p><a href="/r1">res one</a> <a href="/r2">res two</a> <a href="/r3">res three</a></p>
+        <form action="/page" method="post">
+          <input type="hidden" name="page" value="0"><button>Previous</button>
+        </form>
+        <form action="/page" method="post">
+          <input type="hidden" name="page" value="2"><button>Next Page</button>
+        </form>
+        </main></body></html>"#;
+
+    #[tokio::test]
+    async fn post_result_is_addressable_via_handle_and_source_registry_untouched() {
+        let f = Recording::with_post_body(SUBMIT_HTML, RESULT_HTML);
+        let e = engine(f.clone(), 3600);
+
+        // POST form #2 → the report mints a working-memory handle.
+        let report = e.submit("https://e.test/f", 2, &[]).await.unwrap();
+        assert_eq!(report.method, "post");
+        let handle = report.handle.expect("a POST result carries a handle");
+        assert!(handle.starts_with("result:"), "opaque handle: {handle}");
+
+        // The handle resolves the RESULT page's registry (3 links, 2 forms)…
+        let dom = e.dom(&handle, false).await.unwrap();
+        assert_eq!(dom.links.len(), 3, "the result page's own links");
+        assert_eq!(dom.forms.len(), 2, "…and its own forms");
+
+        // …while the source URL's registry is untouched (the collision the
+        // naive fix would cause: final_url == source URL).
+        let src = e.dom("https://e.test/f", false).await.unwrap();
+        assert_eq!(src.links.len(), 2, "source registry unchanged");
+        assert_eq!(src.forms.len(), 2, "source registry unchanged");
+
+        // Interacting THROUGH the handle: submit the result's "Next Page"
+        // form — the second deliberate POST, minting a fresh handle.
+        let next = e.submit(&handle, 2, &[]).await.unwrap();
+        assert!(next.handle.is_some(), "pagination keeps yielding handles");
+        assert_eq!(f.reqs().len(), 2, "two deliberate POSTs, nothing replayed");
+
+        // Clicking a result link off the handle is a normal polite GET —
+        // URL-addressable, so no handle.
+        let click = e.click(&handle, "link:1").await.unwrap();
+        assert_eq!(click.target_url, "https://e.test/r1");
+        assert!(click.handle.is_none(), "a followed link needs no handle");
+
+        // An unknown/expired handle fails honestly, with the way out.
+        let err = e.dom("result:deadbeef00000000", false).await.unwrap_err().to_string();
+        assert!(err.contains("result handle"), "got: {err}");
+        assert!(err.contains("GET URL"), "points at the workaround: {err}");
     }
 
     // ---- dom + snapshots (Phase 12) --------------------------------------

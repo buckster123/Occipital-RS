@@ -167,13 +167,17 @@ struct ClickBody {
 /// `POST /click` — follow a link / submit a form by registry ordinal.
 async fn click(State(s): State<AppState>, Json(b): Json<ClickBody>) -> ApiResult {
     let r = s.engine.click(&b.url, &b.element).await?;
-    Ok(Json(json!({
+    let mut out = json!({
         "kind": "click", "element": r.element, "source_url": r.source_url,
         "target_url": r.target_url, "url": r.page.url, "title": r.page.title,
         "markdown": r.page.markdown, "links": r.page.links, "forms": r.page.forms,
         "salvaged": r.page.salvaged, "js_required": r.page.js_required,
         "content_hash": r.page.content_hash, "from_cache": r.from_cache, "status": r.status,
-    })))
+    });
+    if let Some(h) = &r.handle {
+        out["handle"] = json!(h);
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -188,13 +192,17 @@ struct SubmitBody {
 async fn submit(State(s): State<AppState>, Json(b): Json<SubmitBody>) -> ApiResult {
     let fields: Vec<(String, String)> = b.fields.into_iter().collect();
     let r = s.engine.submit(&b.url, b.form, &fields).await?;
-    Ok(Json(json!({
+    let mut out = json!({
         "kind": "submit", "source_url": r.source_url, "form": r.form, "action": r.action,
         "method": r.method, "sent": r.sent, "status": r.status, "url": r.page.url,
         "title": r.page.title, "markdown": r.page.markdown, "links": r.page.links,
         "forms": r.page.forms, "salvaged": r.page.salvaged, "js_required": r.page.js_required,
         "content_hash": r.page.content_hash, "cached": r.cached,
-    })))
+    });
+    if let Some(h) = &r.handle {
+        out["handle"] = json!(h);
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
