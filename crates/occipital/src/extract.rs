@@ -268,12 +268,39 @@ pub fn extract(html: &str, base_url: &str) -> Page {
 
 /// A page-advertised authored-markdown alternate, when the markup declares
 /// one. Markup-only (zero extra requests) — convention probing (`/llms.txt`,
-/// same-path `.md`) is deliberately not done here.
+/// same-path `.md`) is deliberately not done here (apex1's 5-site field
+/// tally: markup is the majority discovery path — the prober stays unbuilt).
+///
+/// A reported affordance must be a REAL one: an alternate that resolves to a
+/// host that cannot exist is the phantom-Submit bug from a different door
+/// (docs.deno.com advertises `//runtime/index.md` — RFC 3986 reads that as a
+/// network-path reference, host `runtime`, which is DNS-dead; they meant one
+/// slash). A single-label host can't be a public site, so re-read such an
+/// href as root-relative against the page's origin — the URL that actually
+/// serves — and if it still doesn't resolve plausibly, report nothing rather
+/// than a dead URL.
 fn markdown_alternate(doc: &Html, base: Option<&Url>) -> Option<String> {
     let sel = Selector::parse(r#"link[rel="alternate"][type="text/markdown"]"#).ok()?;
+    let plausible = |u: &str| -> Option<String> {
+        let parsed = Url::parse(u).ok()?;
+        let host = parsed.host_str()?;
+        let page_host = base.and_then(|b| b.host_str());
+        // Dotted host = public-plausible; host == the page's own (covers
+        // localhost/intranet pages, where single-label is the norm).
+        (host.contains('.') || Some(host) == page_host).then(|| parsed.to_string())
+    };
     doc.select(&sel)
         .filter_map(|l| l.value().attr("href"))
-        .find_map(|href| resolve(base, href))
+        .find_map(|href| {
+            let resolved = resolve(base, href)?;
+            if let Some(good) = plausible(&resolved) {
+                return Some(good);
+            }
+            // The `//single-label/...` authoring slip: re-read as
+            // root-relative and re-validate.
+            let rest = href.trim().strip_prefix("//")?;
+            plausible(&resolve(base, &format!("/{rest}"))?)
+        })
 }
 
 /// Convenience for raw response bytes (lossy UTF-8 decode).
@@ -1270,6 +1297,58 @@ mod tests {
             </head><body><main><p>content</p></main></body></html>"#;
         let p = extract(html, "https://x.test/");
         assert!(p.markdown_alternate.is_none(), "only text/markdown qualifies");
+    }
+
+    #[test]
+    fn dead_alternate_hrefs_are_repaired_or_dropped_never_reported() {
+        // docs.deno.com shape: `//runtime/index.md` is a network-path
+        // reference per RFC 3986 (host `runtime` — DNS-dead); the site meant
+        // one slash. Re-read as root-relative: the URL that actually serves.
+        let html = r#"<html><head>
+            <link rel="alternate" type="text/markdown" href="//runtime/index.md">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "https://docs.deno.test/runtime/");
+        assert_eq!(
+            p.markdown_alternate.as_deref(),
+            Some("https://docs.deno.test/runtime/index.md"),
+            "the authoring slip is repaired to the page's own origin"
+        );
+
+        // hono.dev shape: a REAL cross-origin alternate (dotted host) is
+        // reported verbatim — the repair must not touch legitimate markup.
+        let html = r#"<html><head>
+            <link rel="alternate" type="text/markdown" href="https://raw.example.net/docs/index.md">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "https://hono.test/docs/");
+        assert_eq!(
+            p.markdown_alternate.as_deref(),
+            Some("https://raw.example.net/docs/index.md"),
+            "cross-origin alternates pass untouched"
+        );
+
+        // An absolute single-label host has no root-relative reading to
+        // repair to — drop it rather than report a dead URL.
+        let html = r#"<html><head>
+            <link rel="alternate" type="text/markdown" href="https://runtime/index.md">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(
+            p.markdown_alternate.is_none(),
+            "a dead affordance is worse than none: {:?}",
+            p.markdown_alternate
+        );
+
+        // On a single-label-host page (localhost dev), its own host is
+        // plausible by definition.
+        let html = r#"<html><head>
+            <link rel="alternate" type="text/markdown" href="/x.md">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "http://localhost:8000/");
+        assert_eq!(
+            p.markdown_alternate.as_deref(),
+            Some("http://localhost:8000/x.md"),
+            "the page's own host is always plausible"
+        );
     }
 
     #[test]
