@@ -139,12 +139,16 @@ struct FetchQ {
 
 async fn fetch(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult {
     let (page, from_cache) = s.engine.fetch(&q.url, q.fresh).await?;
-    Ok(Json(json!({
+    let mut out = json!({
         "kind": "page", "url": page.url, "title": page.title, "markdown": page.markdown,
         "links": page.links, "forms": page.forms, "salvaged": page.salvaged,
         "js_required": page.js_required, "content_hash": page.content_hash,
         "from_cache": from_cache,
-    })))
+    });
+    if let Some(alt) = &page.markdown_alternate {
+        out["markdown_alternate"] = json!(alt);
+    }
+    Ok(Json(out))
 }
 
 /// `GET /dom` — the element registry (links + forms with stable ordinals).

@@ -39,7 +39,7 @@ fn tool_schema(name: &str) -> Value {
         }),
         "web_fetch" => json!({
             "name": "web_fetch",
-            "description": "Fetch a single URL and return it as clean reader-mode Markdown (no nav/ads/chrome) plus its links. Cache-first with a conditional refresh; a live fetch is polite and rate-limited. Links are capped at 120 on the wire; links_total reports the true count (use web_dom with links_from to page through the rest).",
+            "description": "Fetch a single URL and return it as clean reader-mode Markdown (no nav/ads/chrome) plus its links. Cache-first with a conditional refresh; a live fetch is polite and rate-limited. Links are capped at 120 on the wire; links_total reports the true count (use web_dom with links_from to page through the rest). If the page advertises an authored-markdown alternate (<link rel=alternate type=text/markdown>), the response carries markdown_alternate — often a cheaper, cleaner read: fetch that URL if you want it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

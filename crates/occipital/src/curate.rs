@@ -437,6 +437,7 @@ mod tests {
             salvaged: false,
             js_required: false,
             content_hash: "h1".into(),
+            markdown_alternate: None,
         }
     }
 

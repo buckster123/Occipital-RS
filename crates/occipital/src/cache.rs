@@ -166,7 +166,7 @@ impl Cache {
         let row = conn
             .query_row(
                 "SELECT title, byline, markdown, links, forms, salvaged, js_required, \
-                        content_hash, etag, last_modified, fetched_at, pinned \
+                        content_hash, etag, last_modified, fetched_at, pinned, md_alt \
                  FROM pages WHERE url = ?1",
                 params![url],
                 |r| {
@@ -186,17 +186,26 @@ impl Cache {
                         r.get::<_, Option<String>>(9)?, // last_modified
                         fetched_at,
                         r.get::<_, i64>(11)? != 0,       // pinned
+                        r.get::<_, Option<String>>(12)?, // md_alt
                     ))
                 },
             )
             .optional()?;
 
-        let Some((title, byline, markdown, links_json, forms_json, salvaged, js_required, content_hash, etag, last_modified, fetched_at, pinned)) = row
+        let Some((title, byline, markdown, links_json, forms_json, salvaged, js_required, content_hash, etag, last_modified, fetched_at, pinned, md_alt)) = row
         else {
             return Ok(None);
         };
         let links: Vec<Link> = serde_json::from_str(&links_json).unwrap_or_default();
-        let forms: Vec<Form> = serde_json::from_str(&forms_json).unwrap_or_default();
+        let mut forms: Vec<Form> = serde_json::from_str(&forms_json).unwrap_or_default();
+        // `submittable` is derivable from data already in the row — recompute
+        // rather than trust the stored value, so rows written before the flag
+        // existed (serde default: true) are truthful instead of
+        // stale-optimistic. A pre-flight flag that says "yes" and then eats a
+        // refusal is worse than no flag (apex1 seam report, 2026-07-26).
+        for f in &mut forms {
+            f.submittable = crate::extract::form_is_submittable(&f.method, &f.fields);
+        }
         let fetched_at = parse_ts(&fetched_at)?;
         Ok(Some(PageRow {
             page: Page {
@@ -209,6 +218,7 @@ impl Cache {
                 salvaged,
                 js_required,
                 content_hash,
+                markdown_alternate: md_alt,
             },
             etag,
             last_modified,
@@ -235,19 +245,20 @@ impl Cache {
             "INSERT INTO pages \
                (url, title, byline, markdown, links, forms, salvaged, js_required, \
                 content_hash, etag, last_modified, \
-                fetched_at, last_access, access_count, salience, pinned) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,0,1.0,?13) \
+                fetched_at, last_access, access_count, salience, pinned, md_alt) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,0,1.0,?13,?14) \
              ON CONFLICT(url) DO UPDATE SET \
                title=excluded.title, byline=excluded.byline, markdown=excluded.markdown, \
                links=excluded.links, forms=excluded.forms, salvaged=excluded.salvaged, \
                js_required=excluded.js_required, content_hash=excluded.content_hash, \
                etag=excluded.etag, last_modified=excluded.last_modified, \
                fetched_at=excluded.fetched_at, last_access=excluded.last_access, \
-               pinned=excluded.pinned",
+               pinned=excluded.pinned, md_alt=excluded.md_alt",
             params![
                 page.url, page.title, page.byline, page.markdown, links, forms,
                 page.salvaged as i64, page.js_required as i64,
-                page.content_hash, etag, last_modified, now, pinned as i64
+                page.content_hash, etag, last_modified, now, pinned as i64,
+                page.markdown_alternate
             ],
         )?;
         // Keep the FTS keyword index in sync (delete-then-insert; FTS5 has no upsert).
@@ -645,6 +656,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         ("forms", "TEXT NOT NULL DEFAULT '[]'"),          // Phase 12
         ("salvaged", "INTEGER NOT NULL DEFAULT 0"),       // Phase 14
         ("js_required", "INTEGER NOT NULL DEFAULT 0"),    // Phase 14
+        ("md_alt", "TEXT"),                               // field pass round 4
     ];
     for (col, ddl) in ADDED {
         let present: i64 = conn.query_row(
@@ -719,6 +731,7 @@ mod tests {
             salvaged: false,
             js_required: false,
             content_hash: "abc".into(),
+            markdown_alternate: None,
         }
     }
 
@@ -858,6 +871,37 @@ mod tests {
         c.put_page(&p, None, None, false).unwrap();
         let row = c.get_page("https://e.test/f").unwrap().unwrap();
         assert_eq!(row.page.forms, p.forms, "forms JSON roundtrips");
+    }
+
+    #[test]
+    fn stale_optimistic_submittable_is_recomputed_on_read() {
+        use crate::extract::{Form, FormField};
+        let c = Cache::open_in_memory().unwrap();
+        let mut p = page("https://e.test/stale", "body");
+        // Simulate a pre-flag cache row: the stored flag says true (serde
+        // default on old rows), but the fields say the form is dead. The
+        // read path must serve the truth, not the stored optimism (apex1
+        // seam report, 2026-07-26).
+        p.forms = vec![Form {
+            idx:    1,
+            action: "https://e.test/".into(),
+            method: "get".into(),
+            fields: vec![FormField { name: String::new(), kind: "search".into(), ..Default::default() }],
+            submit: None,
+            submittable: true, // the stale lie
+        }];
+        p.markdown_alternate = Some("https://e.test/stale.md".into());
+        c.put_page(&p, None, None, false).unwrap();
+        let row = c.get_page("https://e.test/stale").unwrap().unwrap();
+        assert!(
+            !row.page.forms[0].submittable,
+            "submittable is recomputed from the stored fields on every read"
+        );
+        assert_eq!(
+            row.page.markdown_alternate.as_deref(),
+            Some("https://e.test/stale.md"),
+            "the markdown alternate survives the cache"
+        );
     }
 
     #[test]
