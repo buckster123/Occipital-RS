@@ -166,7 +166,7 @@ impl Cache {
         let row = conn
             .query_row(
                 "SELECT title, byline, markdown, links, forms, salvaged, js_required, \
-                        content_hash, etag, last_modified, fetched_at, pinned, md_alt \
+                        content_hash, etag, last_modified, fetched_at, pinned, md_alt, src_fmt \
                  FROM pages WHERE url = ?1",
                 params![url],
                 |r| {
@@ -187,12 +187,13 @@ impl Cache {
                         fetched_at,
                         r.get::<_, i64>(11)? != 0,       // pinned
                         r.get::<_, Option<String>>(12)?, // md_alt
+                        r.get::<_, Option<String>>(13)?, // src_fmt
                     ))
                 },
             )
             .optional()?;
 
-        let Some((title, byline, markdown, links_json, forms_json, salvaged, js_required, content_hash, etag, last_modified, fetched_at, pinned, md_alt)) = row
+        let Some((title, byline, markdown, links_json, forms_json, salvaged, js_required, content_hash, etag, last_modified, fetched_at, pinned, md_alt, src_fmt)) = row
         else {
             return Ok(None);
         };
@@ -219,6 +220,7 @@ impl Cache {
                 js_required,
                 content_hash,
                 markdown_alternate: md_alt,
+                source_format: src_fmt,
             },
             etag,
             last_modified,
@@ -245,20 +247,20 @@ impl Cache {
             "INSERT INTO pages \
                (url, title, byline, markdown, links, forms, salvaged, js_required, \
                 content_hash, etag, last_modified, \
-                fetched_at, last_access, access_count, salience, pinned, md_alt) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,0,1.0,?13,?14) \
+                fetched_at, last_access, access_count, salience, pinned, md_alt, src_fmt) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,0,1.0,?13,?14,?15) \
              ON CONFLICT(url) DO UPDATE SET \
                title=excluded.title, byline=excluded.byline, markdown=excluded.markdown, \
                links=excluded.links, forms=excluded.forms, salvaged=excluded.salvaged, \
                js_required=excluded.js_required, content_hash=excluded.content_hash, \
                etag=excluded.etag, last_modified=excluded.last_modified, \
                fetched_at=excluded.fetched_at, last_access=excluded.last_access, \
-               pinned=excluded.pinned, md_alt=excluded.md_alt",
+               pinned=excluded.pinned, md_alt=excluded.md_alt, src_fmt=excluded.src_fmt",
             params![
                 page.url, page.title, page.byline, page.markdown, links, forms,
                 page.salvaged as i64, page.js_required as i64,
                 page.content_hash, etag, last_modified, now, pinned as i64,
-                page.markdown_alternate
+                page.markdown_alternate, page.source_format
             ],
         )?;
         // Keep the FTS keyword index in sync (delete-then-insert; FTS5 has no upsert).
@@ -657,6 +659,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         ("salvaged", "INTEGER NOT NULL DEFAULT 0"),       // Phase 14
         ("js_required", "INTEGER NOT NULL DEFAULT 0"),    // Phase 14
         ("md_alt", "TEXT"),                               // field pass round 4
+        ("src_fmt", "TEXT"),                              // field pass round 6
     ];
     for (col, ddl) in ADDED {
         let present: i64 = conn.query_row(
@@ -732,6 +735,7 @@ mod tests {
             js_required: false,
             content_hash: "abc".into(),
             markdown_alternate: None,
+            source_format: None,
         }
     }
 

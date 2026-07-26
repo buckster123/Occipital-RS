@@ -141,6 +141,10 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             if let Some(alt) = &page.markdown_alternate {
                 out["markdown_alternate"] = json!(alt);
             }
+            // Verbatim-passthrough provenance (text/markdown | text/plain).
+            if let Some(sf) = &page.source_format {
+                out["source_format"] = json!(sf);
+            }
             Ok(out)
         }
         "web_dom" => {
@@ -205,6 +209,9 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             if let Some(alt) = &r.page.markdown_alternate {
                 out["markdown_alternate"] = json!(alt);
             }
+            if let Some(sf) = &r.page.source_format {
+                out["source_format"] = json!(sf);
+            }
             // A POST result is not addressable by URL — surface its working-
             // memory handle so the next verb can act on THIS page.
             if let Some(h) = &r.handle {
@@ -263,6 +270,9 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             });
             if let Some(alt) = &r.page.markdown_alternate {
                 out["markdown_alternate"] = json!(alt);
+            }
+            if let Some(sf) = &r.page.source_format {
+                out["source_format"] = json!(sf);
             }
             // A POST result is not addressable by URL — surface its working-
             // memory handle so pagination is discoverable without docs.

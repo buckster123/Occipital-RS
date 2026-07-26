@@ -122,6 +122,12 @@ pub struct Page {
     /// `/llms.txt` conventions is the parked follow-on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub markdown_alternate: Option<String>,
+    /// Which path produced `markdown`: `"markdown"` / `"text"` when the body
+    /// passed through VERBATIM (the server declared text/markdown or
+    /// text/plain), absent when it came out of the HTML extractor. Same
+    /// instinct as `from_handle`: say which door this came through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
 }
 
 /// Tags whose subtrees are boilerplate — skipped entirely. Form *internals*
@@ -263,6 +269,7 @@ pub fn extract(html: &str, base_url: &str) -> Page {
         js_required,
         content_hash,
         markdown_alternate: markdown_alternate(&doc, base.as_ref()),
+        source_format: None,
     }
 }
 
@@ -306,6 +313,137 @@ fn markdown_alternate(doc: &Html, base: Option<&Url>) -> Option<String> {
 /// Convenience for raw response bytes (lossy UTF-8 decode).
 pub fn extract_bytes(bytes: &[u8], base_url: &str) -> Page {
     extract(&String::from_utf8_lossy(bytes), base_url)
+}
+
+/// Entry point for a fetched response: branch on the server's DECLARED
+/// content type. Markdown/plain bodies pass through verbatim — the HTML
+/// extractor normalizes newlines as insignificant whitespace, but in
+/// markdown newlines ARE the syntax, so a `.md` alternate collapsed to one
+/// line and an `llms.txt` (by construction a link index) lost its whole
+/// link graph (apex1 round-six field report, 2026-07-26). A branch, not a
+/// heuristic: the server told us what it sent.
+pub fn extract_response(body: &[u8], base_url: &str, content_type: Option<&str>) -> Page {
+    let media = content_type
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.as_str() {
+        "text/markdown" | "text/x-markdown" => {
+            extract_markdown(&String::from_utf8_lossy(body), base_url, "markdown")
+        }
+        "text/plain" => extract_markdown(&String::from_utf8_lossy(body), base_url, "text"),
+        _ => extract_bytes(body, base_url),
+    }
+}
+
+/// Verbatim reader for authored markdown (and plain text — what the
+/// `llms.txt` convention ships): no HTML extraction, no whitespace
+/// normalization. Frontmatter `title:` is lifted and the block stripped
+/// (falling back to the first `# ` heading); inline `[t](u)` links and
+/// reference definitions `[label]: url` are collected, resolved against the
+/// fetched URL — root-relative hrefs are the norm in authored docs, so
+/// resolution is the load-bearing part.
+pub fn extract_markdown(text: &str, base_url: &str, source_format: &str) -> Page {
+    let base = Url::parse(base_url).ok();
+    let (front_title, body) = split_frontmatter(text);
+    let markdown = body.trim().to_string();
+    let title = front_title.or_else(|| {
+        markdown
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("# ").map(|t| t.trim().to_string()))
+            .filter(|t| !t.is_empty())
+    });
+    let links = markdown_links(&markdown, base.as_ref());
+    let content_hash = fnv1a_hex(markdown.as_bytes());
+    Page {
+        url: base_url.to_string(),
+        title,
+        byline: None,
+        markdown,
+        links,
+        forms: Vec::new(),
+        salvaged: false,
+        js_required: false,
+        content_hash,
+        markdown_alternate: None,
+        source_format: Some(source_format.to_string()),
+    }
+}
+
+/// A leading YAML frontmatter block: `---` on the first line, closed by the
+/// next `---` line. Returns the lifted `title:` (unquoted) and the body
+/// after the block — or the whole text when there is no block.
+fn split_frontmatter(text: &str) -> (Option<String>, &str) {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return (None, text);
+    }
+    let mut title = None;
+    let mut consumed = text.find('\n').map(|i| i + 1).unwrap_or(text.len());
+    for line in text[consumed..].lines() {
+        let line_len = line.len() + 1; // +1 for the newline (last line may lack it — bounded below)
+        if line.trim_end() == "---" {
+            consumed = (consumed + line_len).min(text.len());
+            return (title, &text[consumed..]);
+        }
+        if let Some(v) = line.strip_prefix("title:") {
+            let v = v.trim().trim_matches('"').trim_matches('\'').trim();
+            if !v.is_empty() {
+                title = Some(v.to_string());
+            }
+        }
+        consumed = (consumed + line_len).min(text.len());
+    }
+    // No closing delimiter — not frontmatter after all; leave the text whole.
+    (None, text)
+}
+
+/// Inline `[text](url)` links (images skipped) + reference definitions
+/// `[label]: url`, resolved absolute.
+fn markdown_links(text: &str, base: Option<&Url>) -> Vec<Link> {
+    let mut out: Vec<Link> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(off) = text[i..].find('[') {
+        let start = i + off;
+        i = start + 1;
+        if start > 0 && bytes[start - 1] == b'!' {
+            continue; // image
+        }
+        let Some(close_off) = text[start..].find(']') else { break };
+        let label = text[start + 1..start + close_off].trim();
+        let after = start + close_off + 1;
+        if text[after..].starts_with('(') {
+            let Some(paren_off) = text[after..].find(')') else { continue };
+            // `(url "optional title")` — the URL is the first token.
+            let raw = text[after + 1..after + paren_off]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if let Some(u) = resolve(base, raw) {
+                out.push(Link { text: label.to_string(), url: u });
+            }
+            i = after + paren_off + 1;
+        }
+    }
+    // Reference definitions carry the URL graph of reference-style docs.
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix('[') {
+            if let Some((label, tail)) = rest.split_once("]:") {
+                let raw = tail.split_whitespace().next().unwrap_or("");
+                if let Some(u) = resolve(base, raw) {
+                    if !out.iter().any(|l| l.url == u) {
+                        out.push(Link { text: label.trim().to_string(), url: u });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Pick the main content container: the largest `<main>`/`<article>`/`[role=main]`
@@ -1297,6 +1435,63 @@ mod tests {
             </head><body><main><p>content</p></main></body></html>"#;
         let p = extract(html, "https://x.test/");
         assert!(p.markdown_alternate.is_none(), "only text/markdown qualifies");
+    }
+
+    #[test]
+    fn markdown_passthrough_preserves_structure_lifts_title_and_links() {
+        // The deno .md shape: frontmatter + headings + fences + root-relative
+        // links. The HTML extractor collapsed all of it to one line — in
+        // markdown, newlines ARE the syntax.
+        let md = "---\nlast_modified: 2026-07-09\ntitle: \"Get started with Deno\"\n---\n[Deno](/runtime/getting_started/) is an open source runtime.\n\n## Why Deno?\n\n- **Works with [Node.js projects](/runtime/node/).**\n\n```sh\ncurl -fsSL https://deno.test/install.sh | sh\n```\n\nSee [the manual][manual].\n\n[manual]: /runtime/manual/\n";
+        let p = extract_markdown(md, "https://docs.deno.test/runtime/index.md", "markdown");
+
+        assert_eq!(p.title.as_deref(), Some("Get started with Deno"), "frontmatter title lifted");
+        assert!(!p.markdown.contains("last_modified"), "frontmatter stripped from the body");
+        assert!(p.markdown.contains("\n## Why Deno?"), "headings keep their lines");
+        assert!(p.markdown.contains("```sh\ncurl"), "fences intact");
+        let urls: Vec<&str> = p.links.iter().map(|l| l.url.as_str()).collect();
+        assert!(urls.contains(&"https://docs.deno.test/runtime/getting_started/"), "{urls:?}");
+        assert!(urls.contains(&"https://docs.deno.test/runtime/node/"), "root-relative resolved: {urls:?}");
+        assert!(urls.contains(&"https://docs.deno.test/runtime/manual/"), "reference defs collected: {urls:?}");
+        assert_eq!(p.source_format.as_deref(), Some("markdown"));
+        assert!(p.forms.is_empty());
+
+        // No frontmatter: the first `# ` heading is the title; images are
+        // not links.
+        let md = "# Vite Guide\n\n![logo](/logo.svg)\n\nGetting started: [config](/config/).\n";
+        let p = extract_markdown(md, "https://vite.test/guide.md", "markdown");
+        assert_eq!(p.title.as_deref(), Some("Vite Guide"));
+        let urls: Vec<&str> = p.links.iter().map(|l| l.url.as_str()).collect();
+        assert!(!urls.iter().any(|u| u.ends_with("logo.svg")), "images skipped: {urls:?}");
+        assert!(urls.contains(&"https://vite.test/config/"), "{urls:?}");
+
+        // llms.txt (text/plain): a link index must SURVIVE as links.
+        let txt = "# Vite\n\n## Docs\n\n- [Getting Started](https://vite.test/guide.md): intro\n- [CLI](https://vite.test/cli.md): commands\n";
+        let p = extract_markdown(txt, "https://vite.test/llms.txt", "text");
+        assert_eq!(p.links.len(), 2, "the index is the point: {:?}", p.links);
+        assert_eq!(p.source_format.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn extract_response_branches_on_declared_content_type() {
+        let md = b"# T\n\nbody line one\nline two\n";
+        let p = extract_response(md, "https://x.test/f.md", Some("text/markdown; charset=utf-8"));
+        assert_eq!(p.source_format.as_deref(), Some("markdown"));
+        assert!(p.markdown.contains("line one\nline two"), "verbatim newlines: {}", p.markdown);
+
+        // Unclosed frontmatter is not frontmatter — the text stays whole.
+        let odd = b"---\ntitle: x\nno closing delimiter";
+        let p = extract_response(odd, "https://x.test/f.md", Some("text/markdown"));
+        assert!(p.markdown.contains("no closing delimiter"));
+        assert!(p.markdown.starts_with("---"), "unclosed block left in place: {}", p.markdown);
+
+        // HTML (or undeclared) keeps going through the extractor.
+        let html = b"<html><body><main><h1>H</h1><p>b</p></main></body></html>";
+        let p = extract_response(html, "https://x.test/", Some("text/html; charset=utf-8"));
+        assert!(p.source_format.is_none());
+        assert!(p.markdown.contains("# H"));
+        let p = extract_response(html, "https://x.test/", None);
+        assert!(p.source_format.is_none(), "no declared type -> extractor path");
     }
 
     #[test]

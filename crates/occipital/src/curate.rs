@@ -438,6 +438,7 @@ mod tests {
             js_required: false,
             content_hash: "h1".into(),
             markdown_alternate: None,
+            source_format: None,
         }
     }
 
