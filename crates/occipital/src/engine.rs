@@ -552,6 +552,24 @@ impl Engine {
             anyhow::anyhow!("no form #{form_idx} on {} ({} forms in the registry — see web_dom)", page.url, page.forms.len())
         })?;
 
+        // A GET form with zero NAMED fields cannot carry data by construction
+        // — the submission collapses to a bare GET of the action, and the
+        // returned page is indistinguishable from "searched, found nothing"
+        // (react.dev's Algolia modal triggers, apex1 field report 2026-07-26:
+        // an affirmative false result). Refuse honestly instead. Computed
+        // from the fields here, never trusted from a cached `submittable`
+        // flag (old cache rows default it true). Empty-field POST stays
+        // allowed: an empty POST to its action can still be a deliberate
+        // server-side act, and it returns a live status.
+        if form.method != "post" && !form.fields.iter().any(|f| !f.name.is_empty()) {
+            anyhow::bail!(
+                "form #{form_idx} on {} has no named fields — script-driven; submitting it \
+                 would only re-fetch {} (see the registry's `submittable` flag)",
+                page.url,
+                form.action
+            );
+        }
+
         // An override naming a field the form doesn't have is almost certainly
         // a typo — refuse rather than silently misfire.
         for (name, _) in overrides {
@@ -1268,6 +1286,41 @@ mod tests {
         let err = e.dom("result:deadbeef00000000", false).await.unwrap_err().to_string();
         assert!(err.contains("result handle"), "got: {err}");
         assert!(err.contains("GET URL"), "points at the workaround: {err}");
+    }
+
+    /// The react.dev shape: a GET "search" form whose only field is unnamed
+    /// (an Algolia modal trigger) + an empty-field POST button form.
+    const DEAD_FORM_HTML: &str = r#"<html><head><title>D</title></head><body><main>
+        <form action="https://e.test/"><input type="text" aria-label="Search"><button>Go</button></form>
+        <form action="/act" method="post"><button>Do it</button></form>
+        </main></body></html>"#;
+
+    #[tokio::test]
+    async fn get_form_with_no_named_fields_is_refused_not_a_silent_refetch() {
+        let f = Recording::new(DEAD_FORM_HTML);
+        let e = engine(f.clone(), 3600);
+
+        // The old behaviour re-fetched the page and returned it as a
+        // "result" — an affirmative false answer. Now: honest refusal,
+        // and no second fetch happens at all.
+        let err = e.submit("https://e.test/d", 1, &[]).await.unwrap_err().to_string();
+        assert!(err.contains("no named fields"), "got: {err}");
+        assert_eq!(f.gets().len(), 1, "refusal makes no second fetch (the no-op did)");
+
+        // click form:N routes through submit — same refusal.
+        let err = e.click("https://e.test/d", "form:1").await.unwrap_err().to_string();
+        assert!(err.contains("no named fields"), "got: {err}");
+
+        // An empty-field POST is a deliberate act with a live status —
+        // still allowed.
+        let report = e.submit("https://e.test/d", 2, &[]).await.unwrap();
+        assert_eq!(report.method, "post");
+        assert_eq!(f.reqs().len(), 1, "the POST went out");
+
+        // And the registry says so up front.
+        let dom = e.dom("https://e.test/d", false).await.unwrap();
+        assert!(!dom.forms[0].submittable, "the dead form is flagged");
+        assert!(dom.forms[1].submittable, "the POST button form is not");
     }
 
     // ---- dom + snapshots (Phase 12) --------------------------------------

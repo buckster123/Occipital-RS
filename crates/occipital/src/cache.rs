@@ -853,6 +853,7 @@ mod tests {
             method: "get".into(),
             fields: vec![FormField { name: "q".into(), kind: "text".into(), ..Default::default() }],
             submit: Some("Go".into()),
+            submittable: true,
         }];
         c.put_page(&p, None, None, false).unwrap();
         let row = c.get_page("https://e.test/f").unwrap().unwrap();

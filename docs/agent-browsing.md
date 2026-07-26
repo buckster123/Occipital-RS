@@ -185,6 +185,28 @@ residual links (the affordance note now carries the "don't bother with the verbs
 signal); Bing `aclick` unwrapping (base64 blob, sponsored-only — verified a non-issue in the
 field).
 
+### Round three — the dead-form bug and the survey tells
+
+apex1's third report verified `from_handle` and the affordance widening in the field, then
+caught a NEW bug and surveyed six docs sites for what search markup actually looks like:
+
+- **Dead forms refused, not no-op'd.** react.dev's "search" forms are Algolia modal
+  triggers: one unnamed text field, action = the page itself. Submitting one collapsed to a
+  bare re-fetch returned as the "result" — an **affirmative false answer** ("react.dev has
+  no docs on X"). Structural fix: a GET form with zero NAMED fields cannot carry data by
+  construction — `web_submit` now refuses it honestly, and the registry marks it
+  `submittable: false` up front. Empty-field POST stays allowed (a deliberate act with a
+  live status).
+- **Survey-driven tells.** The compound-class hints matched 1/6 surveyed sites; 6/6 carried
+  `aria-label="Search"` — an accessibility requirement, not a styling choice. Added:
+  aria-label word-match ("Research papers" can't trip it), `docsearch` (Algolia DocSearch —
+  Astro/Vite/Tailwind/Prisma/Vue), custom-element tags ending `-search` (`<site-search>`,
+  `<sl-doc-search>`).
+- **The gate is "no submittable SEARCH form", not "no forms".** A newsletter form
+  (docs.pydantic.dev) or a dead trigger (react.dev) must not silence the note — it's
+  suppressed only by a form that could plausibly BE the search (a named text/search field
+  with a searchy name or a "search"-labelled field).
+
 ## The JS door
 
 ### What a real engine buys that the trick can't
