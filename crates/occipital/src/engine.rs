@@ -557,11 +557,10 @@ impl Engine {
         // returned page is indistinguishable from "searched, found nothing"
         // (react.dev's Algolia modal triggers, apex1 field report 2026-07-26:
         // an affirmative false result). Refuse honestly instead. Computed
-        // from the fields here, never trusted from a cached `submittable`
-        // flag (old cache rows default it true). Empty-field POST stays
-        // allowed: an empty POST to its action can still be a deliberate
-        // server-side act, and it returns a live status.
-        if form.method != "post" && !form.fields.iter().any(|f| !f.name.is_empty()) {
+        // live via the shared predicate, never trusted from a stored flag.
+        // Empty-field POST stays allowed: an empty POST to its action can
+        // still be a deliberate server-side act, and it returns a live status.
+        if !crate::extract::form_is_submittable(&form.method, &form.fields) {
             anyhow::bail!(
                 "form #{form_idx} on {} has no named fields — script-driven; submitting it \
                  would only re-fetch {} (see the registry's `submittable` flag)",
@@ -1393,6 +1392,7 @@ mod tests {
             salvaged: false,
             js_required: false,
             content_hash: "h".into(),
+            markdown_alternate: None,
         }
     }
 

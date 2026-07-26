@@ -207,6 +207,33 @@ caught a NEW bug and surveyed six docs sites for what search markup actually loo
   suppressed only by a form that could plausibly BE the search (a named text/search field
   with a searchy name or a "search"-labelled field).
 
+### Round four — the honesty seams and the page that talks back
+
+apex1 verified round three 4/4 (including the stale-cache refusal and the mkdocs-material
+suppression — the two most regression-likely cases), then filed two seams and a proposal:
+
+- **`submittable` recomputed on read.** Pre-flag cache rows serde-defaulted the flag to
+  `true` — stale-optimistic for exactly the pages read before the update, inverting a
+  pre-flight flag's purpose. It's derivable from data already in the row, so the cache read
+  path now recomputes it from the stored fields every time (shared predicate
+  `form_is_submittable`, also used by extraction and the engine's refusal). No migration, no
+  refetch; old rows are truthful.
+- **The trailer stopped lying.** A dead form's reader-view annotation synthesized
+  `submit "Submit"` — prose inviting the exact call `web_submit` refuses (mkdocs.org, where
+  the prose is all a reading model sees). Dead forms now annotate as
+  `· not submittable (no named fields)`; live forms keep their submit label. Cached markdown
+  keeps the old trailer until its next refresh — the registry and the refusal stay truthful
+  regardless.
+- **`markdown_alternate` reported.** vite.dev serves 10.7 KB of authored markdown
+  (`/guide.md`, plus `/llms.txt`) for a page whose SPA HTML is ~150 KB — and says so in its
+  own reader view. Per apex1's conservative cut: when a page *advertises* an alternate via
+  `<link rel="alternate" type="text/markdown">`, page-ish payloads report it as
+  `markdown_alternate` (persisted in the cache, `md_alt` column via the migrate ladder) —
+  reported, never auto-followed; the caller chooses. **Parked follow-on:** convention
+  probing (same-path `.md`, origin-level `/llms.txt` with a per-origin cached HEAD) — wants
+  a second round of field data; vite.dev itself has no `<link>`, so the markup-only cut
+  won't reach it yet.
+
 ## The JS door
 
 ### What a real engine buys that the trick can't

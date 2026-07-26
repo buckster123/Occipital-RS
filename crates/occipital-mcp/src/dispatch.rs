@@ -123,7 +123,7 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
             let fresh = args["fresh"].as_bool().unwrap_or(false);
             let (page, from_cache) = engine.fetch(url, fresh).await?;
             let (links, links_total) = capped_links(&page.links);
-            Ok(json!({
+            let mut out = json!({
                 "kind":         "page",
                 "url":          page.url,
                 "title":        page.title,
@@ -135,7 +135,13 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "js_required":  page.js_required,
                 "content_hash": page.content_hash,
                 "from_cache":   from_cache,
-            }))
+            });
+            // The page's own offer of authored markdown — reported, never
+            // auto-followed (fetch it like any URL if it beats reader-mode).
+            if let Some(alt) = &page.markdown_alternate {
+                out["markdown_alternate"] = json!(alt);
+            }
+            Ok(out)
         }
         "web_dom" => {
             let url = args["url"]
@@ -196,6 +202,9 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "from_cache":   r.from_cache,
                 "status":       r.status,
             });
+            if let Some(alt) = &r.page.markdown_alternate {
+                out["markdown_alternate"] = json!(alt);
+            }
             // A POST result is not addressable by URL — surface its working-
             // memory handle so the next verb can act on THIS page.
             if let Some(h) = &r.handle {
@@ -252,6 +261,9 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "content_hash": r.page.content_hash,
                 "cached":       r.cached,
             });
+            if let Some(alt) = &r.page.markdown_alternate {
+                out["markdown_alternate"] = json!(alt);
+            }
             // A POST result is not addressable by URL — surface its working-
             // memory handle so pagination is discoverable without docs.
             if let Some(h) = &r.handle {

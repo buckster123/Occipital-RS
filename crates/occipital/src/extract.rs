@@ -85,6 +85,16 @@ fn default_true() -> bool {
     true
 }
 
+/// The one rule for whether submitting a form can do anything: a GET form
+/// with zero NAMED fields collapses to a bare re-fetch of its action. Shared
+/// by extraction (stamping the registry), the cache read path (recomputing
+/// over stale rows — a pre-flag row serde-defaults `true`, which inverts the
+/// flag's pre-flight purpose; apex1 seam report 2026-07-26), and the engine's
+/// submit refusal (which never trusts a stored flag).
+pub(crate) fn form_is_submittable(method: &str, fields: &[FormField]) -> bool {
+    method == "post" || fields.iter().any(|f| !f.name.is_empty())
+}
+
 /// The reader-mode result for one page.
 #[derive(Debug, Clone, Serialize)]
 pub struct Page {
@@ -104,6 +114,14 @@ pub struct Page {
     /// Stable content fingerprint (FNV-1a of the markdown) for dedup + change
     /// detection. Deterministic across runs, unlike `DefaultHasher`.
     pub content_hash: String,
+    /// An authored-markdown alternate the page itself advertises
+    /// (`<link rel="alternate" type="text/markdown">`) — 10 KB of curated
+    /// markdown beats reader-mode extraction of a 150 KB SPA (apex1 field
+    /// measurement, vite.dev, 2026-07-26). Reported, never auto-followed:
+    /// the caller chooses. Markup-only discovery — probing same-path `.md` /
+    /// `/llms.txt` conventions is the parked follow-on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown_alternate: Option<String>,
 }
 
 /// Tags whose subtrees are boilerplate — skipped entirely. Form *internals*
@@ -244,7 +262,18 @@ pub fn extract(html: &str, base_url: &str) -> Page {
         salvaged,
         js_required,
         content_hash,
+        markdown_alternate: markdown_alternate(&doc, base.as_ref()),
     }
+}
+
+/// A page-advertised authored-markdown alternate, when the markup declares
+/// one. Markup-only (zero extra requests) — convention probing (`/llms.txt`,
+/// same-path `.md`) is deliberately not done here.
+fn markdown_alternate(doc: &Html, base: Option<&Url>) -> Option<String> {
+    let sel = Selector::parse(r#"link[rel="alternate"][type="text/markdown"]"#).ok()?;
+    doc.select(&sel)
+        .filter_map(|l| l.value().attr("href"))
+        .find_map(|href| resolve(base, href))
 }
 
 /// Convenience for raw response bytes (lossy UTF-8 decode).
@@ -341,10 +370,7 @@ fn extract_forms(doc: &Html, base: Option<&Url>, page_url: &str) -> (Vec<Form>, 
         };
         let (fields, submit) = extract_fields(el, &labels);
         nodes.push(el.id());
-        // A GET form with no named fields is a structural no-op (see the
-        // `submittable` doc); an empty-field POST stays submittable — an
-        // empty POST to a distinct action can still be a server-side act.
-        let submittable = method == "post" || fields.iter().any(|f| !f.name.is_empty());
+        let submittable = form_is_submittable(&method, &fields);
         forms.push(Form { idx, action, method, fields, submit, submittable });
     }
     (forms, nodes)
@@ -470,7 +496,15 @@ fn form_annotation(form: &Form, base: Option<&Url>) -> String {
     if hidden > 0 {
         parts.push(format!("hidden×{hidden}"));
     }
-    parts.push(format!("submit \"{}\"", form.submit.as_deref().unwrap_or("Submit")));
+    // The prose must carry what the registry knows: a dead form annotated
+    // with a synthesized `submit "Submit"` actively invites the call that
+    // will be refused (apex1 seam report, 2026-07-26 — mkdocs.org, where the
+    // prose is the only thing a reading model sees).
+    if form.submittable {
+        parts.push(format!("submit \"{}\"", form.submit.as_deref().unwrap_or("Submit")));
+    } else {
+        parts.push("not submittable (no named fields)".into());
+    }
     format!(
         "[form#{} → {} {} — {}]",
         form.idx,
@@ -1182,6 +1216,60 @@ mod tests {
         // Custom-element tags: <site-search> (pydantic), <sl-doc-search> (astro).
         let html = r#"<body><site-search></site-search><main><p>content</p></main></body>"#;
         assert!(extract(html, "https://x.test/").markdown.contains("search affordance"));
+    }
+
+    #[test]
+    fn dead_form_trailer_is_honest_not_inviting() {
+        // mkdocs.org shape: a bare GET form whose only field is an unnamed
+        // type=search input, no submit button. The old trailer synthesized
+        // `submit "Submit"` — prose inviting the exact call web_submit
+        // refuses. Prose and registry must agree.
+        let html = r#"<main><form action="/"><input type="search" placeholder="Search..."></form>
+            <p>content</p></main>"#;
+        let p = extract(html, "https://mkdocs.test/");
+        assert!(!p.forms[0].submittable);
+        assert!(
+            p.markdown.contains("not submittable (no named fields)"),
+            "the trailer must carry what the registry knows: {}",
+            p.markdown
+        );
+        assert!(
+            !p.markdown.contains("submit \""),
+            "no synthesized submit label on a dead form: {}",
+            p.markdown
+        );
+
+        // A live form keeps its submit label exactly as before.
+        let html = r#"<main><form action="/s"><input type="text" name="q"><button>Go</button></form>
+            <p>content</p></main>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(p.markdown.contains("submit \"Go\""), "{}", p.markdown);
+    }
+
+    #[test]
+    fn markdown_alternate_is_reported_when_the_page_advertises_one() {
+        // vite.dev shape (had it used the markup): authored markdown offered
+        // via <link rel=alternate> — report it, resolved absolute, and never
+        // invent one when it's absent.
+        let html = r#"<html><head>
+            <link rel="alternate" type="text/markdown" href="/guide.md">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "https://vite.test/guide/");
+        assert_eq!(
+            p.markdown_alternate.as_deref(),
+            Some("https://vite.test/guide.md"),
+            "relative href resolves against the page"
+        );
+
+        let p = extract("<main><p>content</p></main>", "https://x.test/");
+        assert!(p.markdown_alternate.is_none(), "never invented");
+
+        // Other alternate types (rss etc.) don't count.
+        let html = r#"<html><head>
+            <link rel="alternate" type="application/rss+xml" href="/feed.xml">
+            </head><body><main><p>content</p></main></body></html>"#;
+        let p = extract(html, "https://x.test/");
+        assert!(p.markdown_alternate.is_none(), "only text/markdown qualifies");
     }
 
     #[test]
