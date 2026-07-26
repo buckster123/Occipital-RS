@@ -17,7 +17,7 @@ use crate::config::{
 use crate::curate::{make_auto_distiller, make_distiller, Distiller};
 use crate::decay::{decay_factor, effective_salience};
 use crate::embed::{cosine, make_embedder, Embedder};
-use crate::extract::{extract_bytes, Form, Page};
+use crate::extract::{extract_response, Form, Page};
 use crate::fetch::{Fetcher, HttpRequest, PoliteFetcher};
 use crate::keys::Keys;
 use crate::providers::{provider_for, SearchProvider, SearchResult};
@@ -414,7 +414,7 @@ impl Engine {
                     }
                     return Ok((row.page.clone(), true));
                 }
-                let page = extract_bytes(&resp.body, &resp.final_url);
+                let page = extract_response(&resp.body, &resp.final_url, resp.content_type.as_deref());
                 let html = String::from_utf8_lossy(&resp.body);
                 self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), row.pinned)?;
                 return Ok((page, false));
@@ -423,7 +423,7 @@ impl Engine {
 
         // Miss or fresh-forced: live fetch, preserving any existing pin.
         let resp = self.fetcher.get(url).await?;
-        let page = extract_bytes(&resp.body, &resp.final_url);
+        let page = extract_response(&resp.body, &resp.final_url, resp.content_type.as_deref());
         let html = String::from_utf8_lossy(&resp.body);
         let pinned = existing.as_ref().map(|r| r.pinned).unwrap_or(false);
         self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), pinned)?;
@@ -433,7 +433,7 @@ impl Engine {
     /// Fetch + pin a URL (exempt from decay-based eviction until its TTL).
     pub async fn save(&self, url: &str) -> anyhow::Result<Page> {
         let resp = self.fetcher.get(url).await?;
-        let page = extract_bytes(&resp.body, &resp.final_url);
+        let page = extract_response(&resp.body, &resp.final_url, resp.content_type.as_deref());
         let html = String::from_utf8_lossy(&resp.body);
         self.index(&page, &html, resp.etag.as_deref(), resp.last_modified.as_deref(), true)?;
         Ok(page)
@@ -616,7 +616,7 @@ impl Engine {
                 .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .finish();
             let resp = self.fetcher.request(HttpRequest::post_form(&action, body.into_bytes())).await?;
-            let result = extract_bytes(&resp.body, &resp.final_url);
+            let result = extract_response(&resp.body, &resp.final_url, resp.content_type.as_deref());
             // The result stays out of the durable cache (a POST is not
             // reproducible from its URL) but goes into the in-memory result
             // store, so the NEXT verb can address its ordinals via the handle
@@ -976,19 +976,23 @@ mod tests {
         body:           Vec<u8>,
         calls:          AtomicUsize,
         conditional_304: bool,
+        content_type:   Option<String>,
     }
     impl Counting {
         fn new(body: &str) -> Arc<Self> {
-            Arc::new(Self { body: body.as_bytes().to_vec(), calls: AtomicUsize::new(0), conditional_304: false })
+            Arc::new(Self { body: body.as_bytes().to_vec(), calls: AtomicUsize::new(0), conditional_304: false, content_type: None })
         }
         fn with_304(body: &str) -> Arc<Self> {
-            Arc::new(Self { body: body.as_bytes().to_vec(), calls: AtomicUsize::new(0), conditional_304: true })
+            Arc::new(Self { body: body.as_bytes().to_vec(), calls: AtomicUsize::new(0), conditional_304: true, content_type: None })
+        }
+        fn with_content_type(body: &str, ct: &str) -> Arc<Self> {
+            Arc::new(Self { body: body.as_bytes().to_vec(), calls: AtomicUsize::new(0), conditional_304: false, content_type: Some(ct.into()) })
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
         fn resp(&self, url: &str, status: u16, body: Vec<u8>) -> FetchResponse {
-            FetchResponse { final_url: url.into(), status, content_type: None, etag: Some("v1".into()), last_modified: None, body, source: Source::Network }
+            FetchResponse { final_url: url.into(), status, content_type: self.content_type.clone(), etag: Some("v1".into()), last_modified: None, body, source: Source::Network }
         }
     }
     #[async_trait]
@@ -1322,6 +1326,26 @@ mod tests {
         assert!(dom.forms[1].submittable, "the POST button form is not");
     }
 
+    #[tokio::test]
+    async fn markdown_content_type_bypasses_the_html_extractor_and_survives_the_cache() {
+        let md = "---\ntitle: \"Get Started\"\n---\n## Install\n\n- [step one](/docs/one/)\n";
+        let f = Counting::with_content_type(md, "text/markdown; charset=utf-8");
+        let e = engine(f.clone(), 3600);
+
+        let (p1, c1) = e.fetch("https://docs.test/index.md", false).await.unwrap();
+        assert!(!c1);
+        assert_eq!(p1.source_format.as_deref(), Some("markdown"));
+        assert_eq!(p1.title.as_deref(), Some("Get Started"));
+        assert!(p1.markdown.contains("\n\n- [step one]"), "structure verbatim: {}", p1.markdown);
+        assert_eq!(p1.links[0].url, "https://docs.test/docs/one/", "md links resolved");
+
+        // The cache hit serves the same provenance (src_fmt column).
+        let (p2, c2) = e.fetch("https://docs.test/index.md", false).await.unwrap();
+        assert!(c2, "second read is the cache");
+        assert_eq!(p2.source_format.as_deref(), Some("markdown"), "provenance survives the cache");
+        assert_eq!(p2.markdown, p1.markdown);
+    }
+
     // ---- dom + snapshots (Phase 12) --------------------------------------
 
     const FORM_HTML: &str = r#"<html><head><title>S</title></head><body><main>
@@ -1393,6 +1417,7 @@ mod tests {
             js_required: false,
             content_hash: "h".into(),
             markdown_alternate: None,
+            source_format: None,
         }
     }
 

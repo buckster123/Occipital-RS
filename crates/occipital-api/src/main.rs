@@ -148,6 +148,9 @@ async fn fetch(State(s): State<AppState>, Query(q): Query<FetchQ>) -> ApiResult 
     if let Some(alt) = &page.markdown_alternate {
         out["markdown_alternate"] = json!(alt);
     }
+    if let Some(sf) = &page.source_format {
+        out["source_format"] = json!(sf);
+    }
     Ok(Json(out))
 }
 

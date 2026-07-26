@@ -250,6 +250,23 @@ suppression — the two most regression-likely cases), then filed two seams and 
   and per-origin probing would double requests to catch it. The tally continues; if the
   ratio inverts, that files the feature.
 
+### Round six — paving the destination
+
+Round five's pointer led somewhere unreadable: `.md` alternates (and `llms.txt`) went
+through the **HTML extractor**, which normalizes newlines as insignificant whitespace — but
+in markdown newlines ARE the syntax. The deno alternate arrived as one 161-lines-in-1 line,
+frontmatter leaked, `title: null`, and `links: []` — an `llms.txt` link index flattened to
+prose loses exactly the machine-readable part that makes the convention worth having.
+
+Fix (`extract_response`): a **branch on the declared content type**, not a heuristic.
+`text/markdown` / `text/x-markdown` / `text/plain` bodies pass through **verbatim** —
+frontmatter `title:` lifted (falling back to the first `# ` heading) and the block
+stripped; inline `[t](u)` links and reference definitions collected and resolved against
+the fetched URL (root-relative is the norm in authored docs), restoring the registry so
+`web_click` traverses `.md` pages and `llms.txt` indexes; `source_format:
+"markdown"|"text"` on the payload says which door the text came through (persisted,
+`src_fmt` column). HTML and undeclared types keep the extractor path unchanged.
+
 ## The JS door
 
 ### What a real engine buys that the trick can't
