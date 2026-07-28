@@ -21,6 +21,7 @@ use crate::extract::{extract_response, Form, Page};
 use crate::fetch::{Fetcher, HttpRequest, PoliteFetcher};
 use crate::keys::Keys;
 use crate::providers::{provider_for, SearchProvider, SearchResult};
+use crate::relate::{related_pages, RelatedPage};
 
 /// One hit from `web_recall` over already-read pages.
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +51,10 @@ pub struct DistilledPage {
     pub backend:    String,
     /// `true` when a current distillation already existed (no LLM call made).
     pub from_cache: bool,
+    /// Top neighbours by shared entities/tags (see `relate`) — "this connects
+    /// to what you already know". Empty (and off the wire) when nothing ties.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related:    Vec<RelatedPage>,
 }
 
 /// One page that failed to distill (the sweep continues past failures).
@@ -71,6 +76,22 @@ pub struct DistillReport {
 /// Default pages per no-URL distill sweep — bounded so one call stays cheap
 /// (each page is an LLM call); `limit` overrides within [1, 10].
 const DEFAULT_DISTILL_SWEEP: usize = 3;
+
+/// Neighbours a fresh distillation carries inline (`DistilledPage::related`).
+const RELATED_IN_DISTILL: usize = 3;
+/// Default `web_related` result count; `limit` overrides within [1, 20].
+const DEFAULT_RELATED: usize = 5;
+
+/// A curated page's neighbourhood — who shares its entities/topics, and how
+/// big the curated store is (an empty `related` over 2 distilled pages means
+/// "nothing curated yet"; over 200 it means "genuinely unconnected").
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedReport {
+    pub url: String,
+    pub title: Option<String>,
+    pub related: Vec<RelatedPage>,
+    pub distilled_total: usize,
+}
 
 /// A link with its stable 1-based ordinal — the handle the interaction verbs
 /// (Phase 13) will click by.
@@ -709,15 +730,27 @@ impl Engine {
         // (url, display_score, decayed_rank)
         let mut ranked: Vec<(String, Option<f32>, f64)> = if let Some(embedder) = &self.embedder {
             let qv = embedder.embed(query)?;
-            cache
-                .all_embeddings()?
-                .into_iter()
-                .map(|(u, v)| {
-                    let cos = cosine(&qv, &v);
-                    let rank = cos as f64 * decay_of(&u);
-                    (u, Some(cos), rank)
-                })
-                .collect()
+            // ANN first (sqlite-vec KNN), over-fetched 5× so the decay
+            // re-ranking below has headroom; brute-force cosine over the BLOB
+            // table whenever the index can't answer — identical results, O(n).
+            match cache.vec_search(&qv, (n * 5).max(50)) {
+                Some(hits) => hits
+                    .into_iter()
+                    .map(|(u, cos)| {
+                        let rank = cos as f64 * decay_of(&u);
+                        (u, Some(cos), rank)
+                    })
+                    .collect(),
+                None => cache
+                    .all_embeddings()?
+                    .into_iter()
+                    .map(|(u, v)| {
+                        let cos = cosine(&qv, &v);
+                        let rank = cos as f64 * decay_of(&u);
+                        (u, Some(cos), rank)
+                    })
+                    .collect(),
+            }
         } else {
             // Keyword matches all have relevance 1.0; decay orders them by recency.
             cache
@@ -752,6 +785,36 @@ impl Engine {
             }
         }
         Ok(hits)
+    }
+
+    /// A curated page's neighbourhood: every other distilled page that shares
+    /// its entities or topic tags, best-tied first (see [`crate::relate`]).
+    /// Relate reads the distillation store only — an undistilled page gets an
+    /// honest "distill it first", not an empty result.
+    pub async fn related(&self, url: &str, limit: Option<usize>) -> anyhow::Result<RelatedReport> {
+        let url = url.trim();
+        if url.is_empty() {
+            anyhow::bail!("empty url");
+        }
+        let Some(cache) = &self.cache else {
+            anyhow::bail!("no cache — nothing to relate");
+        };
+        let all = cache.all_distill_meta()?;
+        let Some(target) = all.iter().find(|m| m.url == url) else {
+            anyhow::bail!(if cache.get_page(url)?.is_some() {
+                format!("page is cached but not distilled — web_distill {url} first; relate walks curated knowledge only")
+            } else {
+                format!("{url} is not in the reading cache — web_fetch it, web_distill it, then relate")
+            });
+        };
+        let n = limit.unwrap_or(DEFAULT_RELATED).clamp(1, 20);
+        let related = related_pages(target, &all, n);
+        Ok(RelatedReport {
+            url: target.url.clone(),
+            title: target.title.clone(),
+            related,
+            distilled_total: all.len(),
+        })
     }
 
     /// Distill cached pages into curated knowledge (summary, key points,
@@ -790,7 +853,7 @@ impl Engine {
                 if let Some(d) = cache.get_distillation(&page.url)? {
                     if d.content_hash == page.content_hash {
                         distilled.push(DistilledPage {
-                            url:        page.url,
+                            url:        page.url.clone(),
                             title:      page.title,
                             summary:    d.summary,
                             key_points: d.key_points,
@@ -799,6 +862,7 @@ impl Engine {
                             model:      d.model.unwrap_or_default(),
                             backend:    "cache".into(),
                             from_cache: true,
+                            related:    inline_related(cache, &page.url),
                         });
                         let remaining = cache.undistilled_count()?;
                         return Ok(DistillReport { distilled, failed, remaining });
@@ -921,6 +985,20 @@ impl Engine {
 /// Distill each target page and store the result — the shared loop behind the
 /// explicit verb and the background tick. Per-page fail-soft: one bad page
 /// lands in `failed` and the loop continues.
+/// The neighbours a `DistilledPage` carries inline — best-effort (a relate
+/// failure must never fail the distill that just succeeded) and bounded.
+fn inline_related(cache: &Cache, url: &str) -> Vec<RelatedPage> {
+    cache
+        .all_distill_meta()
+        .ok()
+        .and_then(|all| {
+            all.iter()
+                .find(|m| m.url == url)
+                .map(|t| related_pages(t, &all, RELATED_IN_DISTILL))
+        })
+        .unwrap_or_default()
+}
+
 async fn distill_targets(
     cache: &Cache,
     distiller: &dyn Distiller,
@@ -934,7 +1012,7 @@ async fn distill_targets(
             Ok(d) => {
                 cache.put_distillation(&target, &d, &row.page.content_hash)?;
                 distilled.push(DistilledPage {
-                    url:        target,
+                    url:        target.clone(),
                     title:      row.page.title,
                     summary:    d.summary,
                     key_points: d.key_points,
@@ -943,6 +1021,7 @@ async fn distill_targets(
                     model:      d.model,
                     backend:    d.backend.to_string(),
                     from_cache: false,
+                    related:    inline_related(cache, &target),
                 });
             }
             Err(e) => failed.push(DistillFailure { url: target, error: e.to_string() }),
@@ -1634,6 +1713,54 @@ mod tests {
         let err = e.distill(None, None).await.unwrap_err().to_string();
         assert!(err.contains("curation disabled"), "got: {err}");
         assert!(!e.curation());
+    }
+
+    // ---- relate (the connective layer) -------------------------------------
+
+    #[tokio::test]
+    async fn related_walks_shared_entities_and_tags() {
+        let f = Counting::new(HTML);
+        let e = engine(f, 3600).with_distiller(Some(MockDistiller::new()));
+        e.fetch("https://e.test/a", false).await.unwrap();
+        e.fetch("https://e.test/b", false).await.unwrap();
+        let report = e.distill(None, None).await.unwrap();
+        assert_eq!(report.distilled.len(), 2);
+
+        // Whichever page distilled second saw the first as an inline neighbour
+        // (the first had an empty store to relate against).
+        let with_rel: Vec<_> = report.distilled.iter().filter(|d| !d.related.is_empty()).collect();
+        assert_eq!(with_rel.len(), 1, "second distillation carries its neighbour inline");
+        assert_eq!(with_rel[0].related[0].shared_entities, vec!["Entity"]);
+
+        // The standalone verb sees the tie from both directions.
+        let rel = e.related("https://e.test/a", None).await.unwrap();
+        assert_eq!(rel.distilled_total, 2);
+        assert_eq!(rel.related.len(), 1);
+        assert_eq!(rel.related[0].url, "https://e.test/b");
+        assert_eq!(rel.related[0].score, 4.0, "1 entity ×2 + 2 tags ×1");
+        assert_eq!(rel.related[0].shared_tags, vec!["tag1", "tag2"]);
+        assert!(rel.related[0].summary_head.starts_with("Distilled:"));
+    }
+
+    #[tokio::test]
+    async fn related_errors_honestly_by_state() {
+        let e = engine(Counting::new(HTML), 3600).with_distiller(Some(MockDistiller::new()));
+
+        // Never fetched → say the page isn't in the cache at all.
+        let err = e.related("https://e.test/nope", None).await.unwrap_err().to_string();
+        assert!(err.contains("not in the reading cache"), "got: {err}");
+
+        // Cached but never curated → say distillation is the missing step.
+        e.fetch("https://e.test/a", false).await.unwrap();
+        let err = e.related("https://e.test/a", None).await.unwrap_err().to_string();
+        assert!(err.contains("not distilled"), "got: {err}");
+
+        // Distilled but alone → an empty neighbourhood with the total that
+        // explains it (1 curated page can't have neighbours).
+        e.distill(Some("https://e.test/a"), None).await.unwrap();
+        let rel = e.related("https://e.test/a", None).await.unwrap();
+        assert!(rel.related.is_empty());
+        assert_eq!(rel.distilled_total, 1);
     }
 
     // ---- auto-distillation (the background tick) ---------------------------

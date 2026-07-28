@@ -79,6 +79,37 @@ pub struct PageMeta {
 
 pub struct Cache {
     conn: Mutex<Connection>,
+    /// vec0 ANN readiness: 0 = untried (the index table is made lazily at the
+    /// first stored vector, sized to that vector's dimension), 1 = answering,
+    /// -1 = parked (extension absent / dimension clash) — semantic recall then
+    /// brute-forces over the `embeddings` BLOBs, identical results, just O(n).
+    #[cfg_attr(not(feature = "embeddings"), allow(dead_code))]
+    vec_ready: std::sync::atomic::AtomicI8,
+}
+
+/// Register the sqlite-vec extension once per process (embeddings builds).
+/// `sqlite3_auto_extension` makes vec0 available to every later connection.
+#[cfg(feature = "embeddings")]
+fn register_sqlite_vec() {
+    use std::sync::OnceLock;
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        unsafe {
+            use rusqlite::ffi::sqlite3_auto_extension;
+            use sqlite_vec::sqlite3_vec_init;
+            // sqlite3_auto_extension expects void(*)(void); transmute is the
+            // canonical way to bridge the extension init signature in Rust
+            // (same as CerebroCortex's registration).
+            type ExtInit = unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *const std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int;
+            sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtInit>(
+                sqlite3_vec_init as *const (),
+            )));
+        }
+    });
 }
 
 const SCHEMA: &str = r#"
@@ -144,11 +175,16 @@ impl Cache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // Auto-extension registration must precede the Connection it serves.
+        #[cfg(feature = "embeddings")]
+        register_sqlite_vec();
         let conn = Connection::open(path)?;
         Self::init(conn)
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
+        #[cfg(feature = "embeddings")]
+        register_sqlite_vec();
         Self::init(Connection::open_in_memory()?)
     }
 
@@ -156,7 +192,10 @@ impl Cache {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            vec_ready: std::sync::atomic::AtomicI8::new(0),
+        })
     }
 
     // ---- pages -----------------------------------------------------------
@@ -273,17 +312,124 @@ impl Cache {
     }
 
     /// Store a page's embedding vector (Micro+). Replaces any prior vector.
+    /// The `embeddings` BLOB table stays the source of truth; the vec0 ANN
+    /// index is derived from it (and self-heals from it — see `vec_upsert`).
     pub fn put_embedding(&self, url: &str, vec: &[f32]) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO embeddings (url, vec) VALUES (?1, ?2)",
             params![url, vec_to_blob(vec)],
         )?;
+        #[cfg(feature = "embeddings")]
+        self.vec_upsert(&conn, url, vec);
         Ok(())
     }
 
-    /// Every stored `(url, vector)` — brute-force cosine search loads these. Fine
-    /// at cache scale; an ANN index (sqlite-vec) is the scale refinement.
+    // ---- vec0 ANN index (embeddings builds) --------------------------------
+
+    /// Keep the vec0 row for `url` in sync, keyed by the **pages rowid**
+    /// (`put_page` is an UPSERT, so the rowid survives refreshes). The index
+    /// table is created lazily at the first vector, sized to that vector's
+    /// dimension — no dimension config, any embedder fits. After a successful
+    /// upsert, rows present in `embeddings` but missing from the index are
+    /// backfilled in one statement, so a store predating the ANN index (or one
+    /// whose index was lost) heals itself on the next write. Any failure parks
+    /// the index and recall brute-forces — never an error upward.
+    #[cfg(feature = "embeddings")]
+    fn vec_upsert(&self, conn: &Connection, url: &str, vec: &[f32]) {
+        use std::sync::atomic::Ordering;
+        if self.vec_ready.load(Ordering::Relaxed) < 0 || vec.is_empty() {
+            return;
+        }
+        let create = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS page_vectors USING vec0(embedding float[{}])",
+            vec.len()
+        );
+        let blob = vec_to_blob(vec);
+        let res = conn.execute_batch(&create).and_then(|()| {
+            conn.execute(
+                "DELETE FROM page_vectors WHERE rowid IN (SELECT rowid FROM pages WHERE url=?1)",
+                params![url],
+            )?;
+            conn.execute(
+                "INSERT INTO page_vectors (rowid, embedding) \
+                 SELECT rowid, ?2 FROM pages WHERE url=?1",
+                params![url, blob],
+            )?;
+            // Self-heal: index anything the BLOB table has that the index lacks.
+            conn.execute(
+                "INSERT INTO page_vectors (rowid, embedding) \
+                 SELECT p.rowid, e.vec FROM embeddings e JOIN pages p ON p.url = e.url \
+                 WHERE p.rowid NOT IN (SELECT rowid FROM page_vectors)",
+                [],
+            )?;
+            Ok(())
+        });
+        match res {
+            Ok(()) => self.vec_ready.store(1, Ordering::Relaxed),
+            Err(e) => {
+                tracing::warn!(
+                    "vec0 index unavailable ({e}) — semantic recall falls back to brute-force cosine"
+                );
+                self.vec_ready.store(-1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// KNN over the vec0 index: `Some(ranked (url, cosine similarity))` when
+    /// the index answers, `None` when it can't — feature off, extension
+    /// absent, or no index yet — and the caller brute-forces instead
+    /// (identical results, just O(n)). Never errors.
+    pub fn vec_search(&self, query_vec: &[f32], k: usize) -> Option<Vec<(String, f32)>> {
+        #[cfg(feature = "embeddings")]
+        {
+            use std::sync::atomic::Ordering;
+            if self.vec_ready.load(Ordering::Relaxed) < 0 || query_vec.is_empty() {
+                return None;
+            }
+            let conn = self.conn.lock().unwrap();
+            let blob = vec_to_blob(query_vec);
+            let run = || -> rusqlite::Result<Vec<(String, f32)>> {
+                let mut stmt = conn.prepare(
+                    // vec0 distance is cosine distance; similarity = 1 - distance.
+                    "SELECT p.url, 1.0 - v.distance \
+                     FROM (SELECT rowid, distance FROM page_vectors \
+                           WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2) v \
+                     JOIN pages p ON p.rowid = v.rowid \
+                     ORDER BY v.distance",
+                )?;
+                let rows = stmt.query_map(params![blob, k as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)? as f32))
+                })?;
+                rows.collect()
+            };
+            match run() {
+                Ok(hits) => {
+                    self.vec_ready.store(1, Ordering::Relaxed);
+                    Some(hits)
+                }
+                Err(e) => {
+                    // A proven index failing is loud; an untried one erroring is
+                    // just "no vectors stored yet" (no such table) — stay quiet
+                    // and let the first put create it.
+                    if self.vec_ready.load(Ordering::Relaxed) == 1 {
+                        tracing::warn!("vec0 search failed ({e}) — brute-force cosine fallback");
+                        self.vec_ready.store(-1, Ordering::Relaxed);
+                    }
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            let _ = (query_vec, k);
+            None
+        }
+    }
+
+    /// Every stored `(url, vector)` — the brute-force cosine FALLBACK loads
+    /// these (recall goes through `vec_search` first), and `vec_upsert`'s
+    /// self-heal treats this table as the source of truth for the ANN index.
     pub fn all_embeddings(&self) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT url, vec FROM embeddings")?;
@@ -406,6 +552,38 @@ impl Cache {
         }))
     }
 
+    /// Every distillation's linkable identity (title joined from pages) — the
+    /// working set the relate layer scores over. Small by construction: only
+    /// curated pages have rows here.
+    pub fn all_distill_meta(&self) -> anyhow::Result<Vec<crate::relate::DistillMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.url, p.title, d.summary, d.entities, d.tags \
+             FROM distillations d LEFT JOIN pages p ON p.url = d.url",
+        )?;
+        let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(url, title, summary, entities, tags)| crate::relate::DistillMeta {
+                url,
+                title,
+                summary,
+                entities: list(entities),
+                tags: list(tags),
+            })
+            .collect())
+    }
+
     /// Pages needing distillation: never distilled, or the page content changed
     /// since (hash mismatch). Newest fetches first — curate fresh reading first.
     pub fn undistilled_urls(&self, limit: usize) -> anyhow::Result<Vec<String>> {
@@ -498,6 +676,17 @@ impl Cache {
 
     pub fn delete_page(&self, url: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // The vec0 row is keyed by the pages rowid — clear it while the row
+        // still exists (rowids get reused; a stale index row would answer for
+        // whatever page inherits the id).
+        #[cfg(feature = "embeddings")]
+        if self.vec_ready.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            conn.execute(
+                "DELETE FROM page_vectors WHERE rowid IN (SELECT rowid FROM pages WHERE url=?1)",
+                params![url],
+            )
+            .ok();
+        }
         let removed = conn.execute("DELETE FROM pages WHERE url=?1", params![url])? > 0;
         conn.execute("DELETE FROM pages_fts WHERE url=?1", params![url])?;
         conn.execute("DELETE FROM embeddings WHERE url=?1", params![url])?;
@@ -736,6 +925,95 @@ mod tests {
             content_hash: "abc".into(),
             markdown_alternate: None,
             source_format: None,
+        }
+    }
+
+    // ---- vec0 ANN index (embeddings builds only) ---------------------------
+
+    #[cfg(feature = "embeddings")]
+    mod vec_index {
+        use super::*;
+
+        /// A tiny deterministic vector per topic (3-dim is a valid vec0 size —
+        /// the index takes its dimension from the first stored vector).
+        fn seed(c: &Cache, url: &str, v: &[f32]) {
+            c.put_page(&page(url, "body"), None, None, false).unwrap();
+            c.put_embedding(url, v).unwrap();
+        }
+
+        #[test]
+        fn knn_matches_brute_force_ordering() {
+            let c = Cache::open_in_memory().unwrap();
+            seed(&c, "https://a", &[1.0, 0.0, 0.0]);
+            seed(&c, "https://b", &[0.9, 0.1, 0.0]);
+            seed(&c, "https://c", &[0.0, 0.0, 1.0]);
+
+            let hits = c.vec_search(&[1.0, 0.0, 0.0], 10).expect("index answers");
+            assert_eq!(hits[0].0, "https://a");
+            assert!((hits[0].1 - 1.0).abs() < 1e-4, "identical vector ≈ similarity 1");
+            assert_eq!(hits[1].0, "https://b");
+            let brute: Vec<String> = {
+                let q = [1.0, 0.0, 0.0];
+                let mut all = c.all_embeddings().unwrap();
+                all.sort_by(|x, y| {
+                    crate::embed::cosine(&q, &y.1)
+                        .partial_cmp(&crate::embed::cosine(&q, &x.1))
+                        .unwrap()
+                });
+                all.into_iter().map(|(u, _)| u).collect()
+            };
+            assert_eq!(
+                hits.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+                brute,
+                "ANN and brute-force agree"
+            );
+        }
+
+        #[test]
+        fn refresh_and_delete_keep_the_index_true() {
+            let c = Cache::open_in_memory().unwrap();
+            seed(&c, "https://a", &[1.0, 0.0, 0.0]);
+            // A refresh (upsert) + re-embed must not duplicate the row.
+            seed(&c, "https://a", &[0.0, 1.0, 0.0]);
+            let hits = c.vec_search(&[0.0, 1.0, 0.0], 10).unwrap();
+            assert_eq!(hits.len(), 1, "one row per page after refresh");
+            assert_eq!(hits[0].0, "https://a");
+            assert!((hits[0].1 - 1.0).abs() < 1e-4, "the CURRENT vector answers");
+
+            // Deleting the page clears its index row (rowids get reused —
+            // a stale row would answer for the next page).
+            assert!(c.delete_page("https://a").unwrap());
+            seed(&c, "https://b", &[0.0, 0.0, 1.0]);
+            let hits = c.vec_search(&[0.0, 1.0, 0.0], 10).unwrap();
+            assert!(
+                hits.iter().all(|(u, _)| u != "https://a"),
+                "deleted page must not answer: {hits:?}"
+            );
+        }
+
+        #[test]
+        fn index_backfills_from_blob_rows_it_missed() {
+            let c = Cache::open_in_memory().unwrap();
+            // Simulate a store predating the ANN index: BLOB rows written
+            // directly, no vec0 rows.
+            for (url, v) in [("https://old1", [1.0f32, 0.0, 0.0]), ("https://old2", [0.0, 1.0, 0.0])] {
+                c.put_page(&page(url, "body"), None, None, false).unwrap();
+                let conn = c.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (url, vec) VALUES (?1, ?2)",
+                    params![url, vec_to_blob(&v)],
+                )
+                .unwrap();
+            }
+            assert!(c.vec_search(&[1.0, 0.0, 0.0], 10).is_none(), "no index yet — brute-force era");
+
+            // The first modern write creates the index AND heals the backlog.
+            seed(&c, "https://new", &[0.0, 0.0, 1.0]);
+            let hits = c.vec_search(&[1.0, 0.0, 0.0], 10).expect("index answers now");
+            let urls: Vec<&str> = hits.iter().map(|(u, _)| u.as_str()).collect();
+            assert!(urls.contains(&"https://old1") && urls.contains(&"https://old2"),
+                "pre-index rows were backfilled: {urls:?}");
+            assert_eq!(hits[0].0, "https://old1");
         }
     }
 

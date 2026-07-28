@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/submit", post(submit))
         .route("/recall", get(recall))
         .route("/distill", post(distill))
+        .route("/related", get(related))
         .route("/save", post(save))
         .route("/forget", delete(forget))
         .route("/log", get(request_log))
@@ -243,6 +244,22 @@ async fn distill(State(s): State<AppState>, body: Option<Json<DistillBody>>) -> 
     Ok(Json(json!({
         "kind": "distill", "count": report.distilled.len(),
         "distilled": report.distilled, "failed": report.failed, "remaining": report.remaining,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RelatedQ {
+    url: String,
+    limit: Option<usize>,
+}
+
+/// `GET /related?url=…` — a curated page's neighbours by shared entities/tags.
+async fn related(State(s): State<AppState>, Query(q): Query<RelatedQ>) -> ApiResult {
+    let report = s.engine.related(&q.url, q.limit).await?;
+    Ok(Json(json!({
+        "kind": "related", "url": report.url, "title": report.title,
+        "count": report.related.len(), "related": report.related,
+        "distilled_total": report.distilled_total,
     })))
 }
 

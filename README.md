@@ -7,7 +7,7 @@
 *Search · read · interact · remember. Pure Rust, one binary, one SQLite file, no browser engine.*
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://rustup.rs)
-[![MCP tools](https://img.shields.io/badge/MCP_tools-9-brightgreen)](#-the-tool-surface-9)
+[![MCP tools](https://img.shields.io/badge/MCP_tools-10-brightgreen)](#-the-tool-surface-10)
 [![Tests](https://img.shields.io/badge/tests-141_passing-brightgreen)](docs/development.md)
 [![Platform](https://img.shields.io/badge/platform-arm64_%7C_x86__64-lightgrey)](#-quick-start)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -155,7 +155,7 @@ The default build is deliberately small — an **8.3 MB** stripped `occipital-mc
 model download — so a Raspberry Pi-class node runs the full web surface. Embeddings are an
 opt-in *build feature*, not just a runtime flag.
 
-## 🧰 The tool surface (9)
+## 🧰 The tool surface (10)
 
 | Tool | What it does |
 |------|--------------|
@@ -168,6 +168,7 @@ opt-in *build feature*, not just a runtime flag.
 | `web_save` | pin a page so decay and GC leave it alone |
 | `web_forget` | evict a page from the cache |
 | `web_distill` | LLM-curate cached pages into summary · key points · entities · tags |
+| `web_related` | walk the knowledge web: a curated page’s neighbours by shared entities/tags |
 
 Every `web_search` / `web_fetch` result is a flat, `kind`-discriminated JSON object that
 doubles as a render payload — a UI can show what the agent is reading without a second
@@ -211,7 +212,7 @@ Four crates, one library:
 ```
 crates/
   occipital/       # the library — fetch · politeness · extract · salvage · providers · cache · decay · curate · session
-  occipital-mcp/   # MCP over stdio — the agent-facing drop-in (9 tools)
+  occipital-mcp/   # MCP over stdio — the agent-facing drop-in (10 tools)
   occipital-api/   # axum REST — management + query
   occipital-cli/   # clap CLI — ops, keys, cookies, queries
 ```
