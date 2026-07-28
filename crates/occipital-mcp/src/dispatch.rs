@@ -336,6 +336,22 @@ async fn route(name: &str, args: &Value, engine: Arc<Engine>) -> anyhow::Result<
                 "remaining": report.remaining,
             }))
         }
+        "web_related" => {
+            let url = args["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("url (non-empty string) required"))?;
+            let limit = args["limit"].as_u64().map(|n| n as usize);
+            let report = engine.related(url, limit).await?;
+            Ok(json!({
+                "kind":            "related",
+                "url":             report.url,
+                "title":           report.title,
+                "count":           report.related.len(),
+                "related":         report.related,
+                "distilled_total": report.distilled_total,
+            }))
+        }
         _ => anyhow::bail!("tool not found: {name}"),
     }
 }
@@ -388,9 +404,76 @@ mod tests {
         let names: Vec<String> = resp["result"]["tools"].as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for expected in ["web_search", "web_fetch", "web_dom", "web_click", "web_submit",
-                         "web_recall", "web_save", "web_forget"] {
+                         "web_recall", "web_save", "web_forget", "web_distill", "web_related"] {
             assert!(names.contains(&expected.to_string()), "must advertise {expected}: {names:?}");
         }
+    }
+
+    /// A no-network distiller whose every page shares one entity + one tag —
+    /// any two distilled pages become neighbours.
+    struct MockD;
+    #[async_trait]
+    impl occipital::Distiller for MockD {
+        async fn distill_page(&self, page: &occipital::Page) -> anyhow::Result<occipital::Distillation> {
+            Ok(occipital::Distillation {
+                summary:    format!("Distilled {}", page.url),
+                key_points: vec![],
+                entities:   vec!["Shared Entity".into()],
+                tags:       vec!["topic".into()],
+                model:      "mock".into(),
+                backend:    "ollama",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn web_related_walks_the_knowledge_web() {
+        let fetcher = Arc::new(Canned(b"<html><title>T</title><body><p>body text here</p></body></html>".to_vec()));
+        let cache = Arc::new(occipital::Cache::open_in_memory().unwrap());
+        let engine = Arc::new(
+            Engine::with_parts(fetcher, Box::new(DuckDuckGo), Some(cache), 5, 3600)
+                .with_distiller(Some(Arc::new(MockD))),
+        );
+        for url in ["https://e.test/a", "https://e.test/b"] {
+            let msg = json!({"jsonrpc":"2.0","id":10,"method":"tools/call",
+                "params":{"name":"web_distill","arguments":{"url": url}}});
+            let resp = dispatch_tool(msg, Arc::clone(&engine)).await;
+            assert!(resp["error"].is_null(), "distill {url}: {}", resp["error"]);
+        }
+
+        let msg = json!({"jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params":{"name":"web_related","arguments":{"url":"https://e.test/a"}}});
+        let resp = dispatch_tool(msg, Arc::clone(&engine)).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["kind"], "related");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["distilled_total"], 2);
+        assert_eq!(out["related"][0]["url"], "https://e.test/b");
+        assert_eq!(out["related"][0]["shared_entities"][0], "Shared Entity");
+        assert_eq!(out["related"][0]["shared_tags"][0], "topic");
+
+        // The second distillation also carried the tie inline.
+        let msg = json!({"jsonrpc":"2.0","id":12,"method":"tools/call",
+            "params":{"name":"web_distill","arguments":{"url":"https://e.test/b"}}});
+        let resp = dispatch_tool(msg, engine).await;
+        let out: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["distilled"][0]["related"][0]["url"], "https://e.test/a",
+            "a from-cache distill re-reports its neighbourhood");
+    }
+
+    #[tokio::test]
+    async fn web_related_requires_distillation_first() {
+        let engine = engine_with("<html><title>T</title><body><p>text</p></body></html>");
+        let msg = json!({"jsonrpc":"2.0","id":13,"method":"tools/call",
+            "params":{"name":"web_fetch","arguments":{"url":"https://e.test/a"}}});
+        dispatch_tool(msg, Arc::clone(&engine)).await;
+
+        let msg = json!({"jsonrpc":"2.0","id":14,"method":"tools/call",
+            "params":{"name":"web_related","arguments":{"url":"https://e.test/a"}}});
+        let resp = dispatch_tool(msg, engine).await;
+        assert!(resp["result"].is_null(), "undistilled page must not succeed");
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(err.contains("web_distill"), "error teaches the missing step: {err}");
     }
 
     #[tokio::test]

@@ -20,10 +20,13 @@ clippy-clean, tests per crate, build incrementally.
 
 | 11 | **Knowledge hub: auto-curation** — background distill sweep in the resident servers (`occipital-mcp`/`-api`), budget-guarded | with `OCCIPITAL_AUTO_DISTILL=local\|on`, newly-read pages distill themselves within an interval, the rolling-24h cap pauses the sweep, and `off` (default) changes nothing | ✓ — `AutoDistill` mode (`off` default \| `local` = Ollama-pinned, never the API \| `on` = the configured backend); `Engine::auto_distill_tick` (shared `distill_targets` loop with the explicit verb): batch = sweep-default clamped to the remaining budget (`Cache::distilled_since` counts ALL distillations — a total-spend guard, restart-proof); quiet when off/capped/nothing-pending. Interval task in both resident servers (`OCCIPITAL_AUTO_DISTILL_INTERVAL_SECS`, default 300, floor 30); CLI `status` + API `/stats` surface curation/auto. Tick/budget/matrix unit-tested (mock distiller) |
 
+| 17 | **Knowledge hub: relate + surface** — `relate` module (pure overlap scoring: entities ×2, tags ×1, case-insensitive, self/zero-overlap excluded, deterministic ties), `Cache::all_distill_meta` (title joined from pages), `Engine::related` + `web_related` tool + CLI `related` + API `GET /related`; every fresh distillation carries its top-3 neighbours inline (`DistilledPage::related`, off the wire when empty) | a curated page lists its neighbours with the shared terms as the edge label; an undistilled page gets an honest "distill it first" (cached vs not-cached worded apart); an empty result carries `distilled_total` so "unconnected" and "nothing curated yet" read differently | ✓ — computed live from `distillations`, never stored (a link table would stale on re-distill/forget); relate does **zero network + zero LLM** (no politeness surface, no live gate needed); embeddings deliberately not consulted (shared entities are the knowledge-graph signal, cosine says "the prose is alike"). 168 tests workspace-wide (relate pure-tested; engine + dispatch via mock distillers), clippy `-D warnings` clean |
+
 Knowledge-hub follow-ons (in "living knowledge hub" order, ApexOS BACKLOG #10):
-semantic dedup + relate/surface across pages, digests ("what did I read about X"),
-the ui-slint distill card, sqlite-vec ANN for `all_embeddings()` scale,
-`ingest_file` (the file → knowledge on-ramp, lands in cerebro-mcp), freshness/re-distill.
+semantic dedup on ingest, digests ("what did I read about X"),
+sqlite-vec ANN for `all_embeddings()` scale, freshness/re-distill.
+(✓ done since this list was written: the ui-slint distill card — ApexOS-RS #287;
+`ingest_file` — landed in cerebro-mcp, ApexOS-RS #279; relate/surface — row 17.)
 
 ### Agent-browsing expansion (Phases 12–16) — design locked in [agent-browsing.md](agent-browsing.md)
 

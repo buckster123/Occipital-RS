@@ -55,6 +55,14 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Neighbours of a curated page (shared entities / topic tags).
+    Related {
+        /// The distilled page to walk from.
+        url: String,
+        /// Max neighbours (default 5, max 20).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Show the recent request trail (what was sent, waited, and refused).
     Log {
         /// Rows to show (newest first).
@@ -220,6 +228,24 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "distilled {} page(s), {} failed, {} still pending",
                 report.distilled.len(), report.failed.len(), report.remaining
+            );
+        }
+        Command::Related { url, limit } => {
+            let engine = Engine::from_config(&config)?;
+            let report = engine.related(&url, limit).await?;
+            for r in &report.related {
+                let mut why = Vec::new();
+                if !r.shared_entities.is_empty() {
+                    why.push(format!("entities: {}", r.shared_entities.join(", ")));
+                }
+                if !r.shared_tags.is_empty() {
+                    why.push(format!("tags: {}", r.shared_tags.join(", ")));
+                }
+                println!("{:.1}  {}\n   {}\n   {}\n", r.score, r.url, r.summary_head, why.join(" · "));
+            }
+            println!(
+                "{} neighbour(s) of {} ({} pages distilled)",
+                report.related.len(), report.url, report.distilled_total
             );
         }
         Command::Status => {

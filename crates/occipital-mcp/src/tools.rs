@@ -15,6 +15,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "web_save",
     "web_forget",
     "web_distill",
+    "web_related",
 ];
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -121,6 +122,18 @@ fn tool_schema(name: &str) -> Value {
                     "limit": { "type": "integer", "description": "Sweep size when no url is given (default: 3, max: 10)" }
                 },
                 "required": []
+            }
+        }),
+        "web_related" => json!({
+            "name": "web_related",
+            "description": "Walk the knowledge web from a curated page: every other distilled page sharing its entities or topic tags, best-tied first, with the shared terms as the edge label. Relate reads distilled knowledge only — an undistilled page gets an honest 'distill it first'. An empty result over a large distilled_total means genuinely unconnected; over a small one it means little is curated yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url":   { "type": "string", "description": "The curated page to find neighbours of" },
+                    "limit": { "type": "integer", "description": "Max neighbours (default: 5, max: 20)" }
+                },
+                "required": ["url"]
             }
         }),
         "web_forget" => json!({

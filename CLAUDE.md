@@ -130,6 +130,7 @@ If-Modified-Since) to refresh cheaply, polite live fetch only on a real miss.
 | `web_save` | force-cache a url (pin; exempt from decay until TTL) |
 | `web_forget` | evict a url / matching set from the cache |
 | `web_distill` | LLM-curate cached pages into knowledge (summary · key points · entities · tags); `url` → that page (fetch-if-uncached, free re-ask on unchanged content), no `url` → bounded sweep of pending pages. Explicit-only — nothing spends tokens on its own |
+| `web_related` | the knowledge web: every other distilled page sharing a curated page’s entities/topic tags, best-tied first, shared terms as the edge label. Computed live from `distillations` (never stored); undistilled page → honest "distill it first". Fresh distillations also carry their top-3 neighbours inline (`related`) |
 
 `web_search`/`web_fetch` emit a **follow-along event** (see docs/follow-along.md) so a consumer
 UI can render what the agent is reading. Pure-MCP consumers ignore it.

@@ -22,6 +22,7 @@ pub mod fetch;
 pub mod keys;
 pub mod providers;
 pub mod ratelimit;
+pub mod relate;
 pub mod robots;
 mod salvage;
 pub mod session;
@@ -38,6 +39,7 @@ pub use keys::Keys;
 pub use extract::{extract, extract_bytes, Form, FormField, Link, Page};
 pub use fetch::{FetchResponse, Fetcher, HttpRequest, Method, PoliteFetcher};
 pub use providers::{SearchProvider, SearchResult};
+pub use relate::{DistillMeta, RelatedPage};
 pub use session::{Cookie, CookieJar, HeaderRules};
 
 /// The crate version (the `serverInfo.version` an MCP client sees).

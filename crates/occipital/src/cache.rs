@@ -406,6 +406,38 @@ impl Cache {
         }))
     }
 
+    /// Every distillation's linkable identity (title joined from pages) — the
+    /// working set the relate layer scores over. Small by construction: only
+    /// curated pages have rows here.
+    pub fn all_distill_meta(&self) -> anyhow::Result<Vec<crate::relate::DistillMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.url, p.title, d.summary, d.entities, d.tags \
+             FROM distillations d LEFT JOIN pages p ON p.url = d.url",
+        )?;
+        let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(url, title, summary, entities, tags)| crate::relate::DistillMeta {
+                url,
+                title,
+                summary,
+                entities: list(entities),
+                tags: list(tags),
+            })
+            .collect())
+    }
+
     /// Pages needing distillation: never distilled, or the page content changed
     /// since (hash mismatch). Newest fetches first — curate fresh reading first.
     pub fn undistilled_urls(&self, limit: usize) -> anyhow::Result<Vec<String>> {
