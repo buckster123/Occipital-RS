@@ -9,7 +9,8 @@ repository.workspace = true
 [features]
 # Opt-in semantic layer (Micro+ tier). Off by default so Nano builds skip the
 # ONNX runtime entirely — smaller binary, faster build, no build-time download.
-embeddings = ["dep:fastembed"]
+# sqlite-vec rides along: the vec0 ANN index only matters when vectors exist.
+embeddings = ["dep:fastembed", "dep:sqlite-vec"]
 
 [dependencies]
 anyhow.workspace      = true
@@ -27,6 +28,7 @@ serde_json.workspace  = true
 rusqlite.workspace    = true
 chrono.workspace      = true
 fastembed             = { workspace = true, optional = true }
+sqlite-vec            = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

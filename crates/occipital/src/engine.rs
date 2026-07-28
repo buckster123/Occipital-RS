@@ -730,15 +730,27 @@ impl Engine {
         // (url, display_score, decayed_rank)
         let mut ranked: Vec<(String, Option<f32>, f64)> = if let Some(embedder) = &self.embedder {
             let qv = embedder.embed(query)?;
-            cache
-                .all_embeddings()?
-                .into_iter()
-                .map(|(u, v)| {
-                    let cos = cosine(&qv, &v);
-                    let rank = cos as f64 * decay_of(&u);
-                    (u, Some(cos), rank)
-                })
-                .collect()
+            // ANN first (sqlite-vec KNN), over-fetched 5× so the decay
+            // re-ranking below has headroom; brute-force cosine over the BLOB
+            // table whenever the index can't answer — identical results, O(n).
+            match cache.vec_search(&qv, (n * 5).max(50)) {
+                Some(hits) => hits
+                    .into_iter()
+                    .map(|(u, cos)| {
+                        let rank = cos as f64 * decay_of(&u);
+                        (u, Some(cos), rank)
+                    })
+                    .collect(),
+                None => cache
+                    .all_embeddings()?
+                    .into_iter()
+                    .map(|(u, v)| {
+                        let cos = cosine(&qv, &v);
+                        let rank = cos as f64 * decay_of(&u);
+                        (u, Some(cos), rank)
+                    })
+                    .collect(),
+            }
         } else {
             // Keyword matches all have relevance 1.0; decay orders them by recency.
             cache
